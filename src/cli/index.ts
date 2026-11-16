@@ -66,7 +66,7 @@ async function main(argv: string[]): Promise<number> {
         if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new AppError(400, 'bad_limit', '--limit must be 1-100');
         const stats = await context.classifier.classifyPending(account, limit);
         console.log(
-          `Classified ${stats.classified} of ${stats.attempted} (${stats.needsReview} need review, ${stats.failed} failed${stats.stoppedEarly ? ', stopped early' : ''}); ${stats.remaining} remaining`,
+          `Classified ${stats.classified} of ${stats.attempted} (${stats.needsReview} need review, ${stats.failed} failed, ${stats.superseded} superseded${stats.stoppedEarly ? ', stopped early' : ''}); ${stats.remaining} remaining`,
         );
         return stats.failed > 0 ? 1 : 0;
       }

@@ -64,7 +64,7 @@ describe('storage', () => {
       accountId: 'demo',
       messageId: message!.id,
       taxonomyRevision: 1,
-      taxonomyHash: 'h',
+      taxonomyHash: s.currentTaxonomy().hash,
       promptVersion: 'p',
       decision: {
         provider: 'fixture',
@@ -74,11 +74,13 @@ describe('storage', () => {
         fields: { category: answered, action: { ...answered, value: 'no_action' }, priority: { ...answered, value: 'low' } },
         usage: null,
       },
-    });
+      expectedDecisionSeq: 0,
+    })!;
     const k = s.insertCorrection({
       accountId: 'demo',
       messageId: message!.id,
-      taxonomyRevision: 1,
+      expectedTaxonomyRevision: 1,
+      expectedDecisionSeq: 1,
       kind: 'edit',
       category: 'receipt',
       action: 'no_action',

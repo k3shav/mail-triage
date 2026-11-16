@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { FetchLike } from '../../providers/http.js';
+import { readBoundedText } from '../http/bounded-body.js';
 
 /**
  * Google OAuth 2.0 for web server applications:
@@ -12,6 +13,7 @@ import type { FetchLike } from '../../providers/http.js';
 export const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 export const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 export const GOOGLE_REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
+const MAX_TOKEN_RESPONSE_BYTES = 64 * 1024;
 
 export interface OAuthClientConfig {
   clientId: string;
@@ -66,7 +68,7 @@ async function tokenRequest(fetchImpl: FetchLike, params: Record<string, string>
   } catch {
     throw new OAuthError('network', 'Could not reach Google');
   }
-  const text = await response.text().catch(() => '');
+  const text = await readBoundedText(response, MAX_TOKEN_RESPONSE_BYTES).catch(() => '');
   let body: unknown;
   try {
     body = JSON.parse(text);

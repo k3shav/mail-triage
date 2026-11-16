@@ -63,6 +63,8 @@ export class FakeGoogle {
   ];
   /** Fail the next N Gmail calls with this status. */
   failNext: { status: number; count: number } | null = null;
+  /** Answer an authorized Gmail call with a custom response; return undefined to fall through. */
+  respond: ((url: URL, method: string) => Response | undefined) | null = null;
   private labelCounter = 0;
 
   addMessages(...messages: FakeMessage[]) {
@@ -140,6 +142,9 @@ export class FakeGoogle {
       this.failNext.count -= 1;
       return this.json({ error: { code: this.failNext.status, status: 'UNAVAILABLE' } }, this.failNext.status);
     }
+
+    const custom = this.respond?.(url, method);
+    if (custom) return custom;
 
     const path = url.pathname.replace('/gmail/v1/users/me', '');
     if (method === 'GET' && path === '/profile') return this.json({ emailAddress: this.email, messagesTotal: this.messages.size });

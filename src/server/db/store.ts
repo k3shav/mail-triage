@@ -8,7 +8,8 @@ import {
   type ReviewPolicy,
 } from '../../core/decision.js';
 import { PROMPT_VERSION } from '../../core/prompt.js';
-import { DEFAULT_TAXONOMY, TaxonomySchema, taxonomyHash, type Taxonomy } from '../../core/taxonomy.js';
+import { DEFAULT_TAXONOMY, TaxonomySchema, isValidOptionId, taxonomyHash, type Taxonomy } from '../../core/taxonomy.js';
+import { AppError } from '../errors.js';
 import type { Db } from './database.js';
 
 export type AccountKind = 'gmail' | 'demo';
@@ -264,6 +265,21 @@ function toRun(row: Row): RunRow {
   };
 }
 
+export interface CorrectionInput {
+  accountId: string;
+  messageId: number;
+  kind: StoredCorrection['kind'];
+  /** Configuration revision the reviewer saw. */
+  expectedTaxonomyRevision: number;
+  /** Message decision sequence the reviewer saw. */
+  expectedDecisionSeq: number;
+  /** Required for `edit`. Optional for `accept`: if given, must equal the classification's values. */
+  category?: string;
+  action?: string;
+  priority?: string;
+  basedOnClassificationId: number | null;
+}
+
 export class StaleRevisionError extends Error {
   override name = 'StaleRevisionError';
   constructor(readonly current: number) {
@@ -463,6 +479,13 @@ export class Store {
 
   // ---- decisions ----------------------------------------------------------
 
+  /**
+   * Store a model result only if nothing changed while the model ran: the
+   * message's decision sequence and the configuration revision must still be
+   * the ones read before inference. Otherwise the result is discarded and
+   * `null` is returned, so a late answer never replaces a newer human
+   * correction or lands on a configuration it was not asked about.
+   */
   insertClassification(input: {
     accountId: string;
     messageId: number;
@@ -470,9 +493,15 @@ export class Store {
     taxonomyHash: string;
     promptVersion: string;
     decision: ProviderDecision;
-  }): StoredClassification {
+    /** `decisionSeq` of the message as read before inference started. */
+    expectedDecisionSeq: number;
+  }): StoredClassification | null {
     return this.db
       .transaction(() => {
+        const current = this.currentTaxonomy();
+        if (current.revision !== input.taxonomyRevision || current.hash !== input.taxonomyHash) return null;
+        const message = this.getMessage(input.accountId, input.messageId);
+        if (!message || message.decisionSeq !== input.expectedDecisionSeq) return null;
         const seq = this.bumpDecisionSeq(input.messageId);
         const result = this.db
           .prepare(
@@ -501,18 +530,78 @@ export class Store {
       .immediate();
   }
 
-  insertCorrection(input: {
-    accountId: string;
-    messageId: number;
-    taxonomyRevision: number;
-    kind: StoredCorrection['kind'];
-    category: string;
-    action: string;
-    priority: string;
-    basedOnClassificationId: number | null;
-  }): StoredCorrection {
+  /**
+   * Record a human decision against exactly what the reviewer saw. In one
+   * transaction: the configuration revision and the message's decision
+   * sequence must match the caller's expectations, a referenced
+   * classification must belong to this message at the current revision, and
+   * an `accept` must name the current model decision and takes its values
+   * from it. Conflicts throw a 409 AppError.
+   */
+  insertCorrection(input: CorrectionInput): StoredCorrection {
     return this.db
       .transaction(() => {
+        const { revision, taxonomy } = this.currentTaxonomy();
+        if (revision !== input.expectedTaxonomyRevision) throw new StaleRevisionError(revision);
+        const message = this.getMessage(input.accountId, input.messageId);
+        if (!message) throw new AppError(404, 'not_found', 'Message not found');
+        if (message.decisionSeq !== input.expectedDecisionSeq) {
+          throw new AppError(409, 'stale_decision', 'The classification or correction changed since you reviewed it. Reload and try again.', {
+            currentDecisionSeq: message.decisionSeq,
+          });
+        }
+
+        let basis: StoredClassification | null = null;
+        if (input.basedOnClassificationId !== null) {
+          basis = this.getClassification(input.basedOnClassificationId);
+          if (!basis || basis.accountId !== input.accountId || basis.messageId !== input.messageId) {
+            throw new AppError(409, 'classification_mismatch', 'That classification does not belong to this message');
+          }
+          if (basis.taxonomyRevision !== revision) {
+            throw new AppError(409, 'classification_mismatch', 'That classification was made for an earlier configuration revision');
+          }
+        }
+
+        let values: { category: string; action: string; priority: string };
+        if (input.kind === 'accept') {
+          // The decision sequence is bumped by every classification and
+          // correction, so only the newest record can carry the current seq.
+          const reviewed = basis;
+          if (!reviewed || reviewed.seq !== message.decisionSeq) {
+            throw new AppError(409, 'not_acceptable', 'Only the current model classification can be accepted. Edit the values instead.');
+          }
+          const answered = (field: 'category' | 'action' | 'priority') => {
+            const result = reviewed.fields[field];
+            return result.status === 'answered' && isValidOptionId(taxonomy, field, result.value) ? result.value : null;
+          };
+          const category = answered('category');
+          const action = answered('action');
+          const priority = answered('priority');
+          if (category === null || action === null || priority === null) {
+            throw new AppError(409, 'not_acceptable', 'This classification has missing or invalid answers. Edit the values instead.');
+          }
+          values = { category, action, priority };
+          for (const field of ['category', 'action', 'priority'] as const) {
+            const claimed = input[field];
+            if (claimed !== undefined && claimed !== values[field]) {
+              throw new AppError(409, 'accept_mismatch', 'The accepted values differ from the classification. Reload and try again.', {
+                field,
+                expected: values[field],
+              });
+            }
+          }
+        } else {
+          if (input.category === undefined || input.action === undefined || input.priority === undefined) {
+            throw new AppError(400, 'invalid_request', 'An edit needs category, action, and priority');
+          }
+          values = { category: input.category, action: input.action, priority: input.priority };
+          for (const field of ['category', 'action', 'priority'] as const) {
+            if (!isValidOptionId(taxonomy, field, values[field])) {
+              throw new AppError(400, `unknown_${field}`, `That ${field} does not exist in the current configuration`);
+            }
+          }
+        }
+
         const seq = this.bumpDecisionSeq(input.messageId);
         const result = this.db
           .prepare(
@@ -523,11 +612,11 @@ export class Store {
             input.accountId,
             input.messageId,
             seq,
-            input.taxonomyRevision,
+            revision,
             input.kind,
-            input.category,
-            input.action,
-            input.priority,
+            values.category,
+            values.action,
+            values.priority,
             input.basedOnClassificationId,
             this.now(),
           );
@@ -716,6 +805,19 @@ export class Store {
       )
       .run(name, owner, now + ttlMs, now);
     return result.changes === 1;
+  }
+
+  /**
+   * Extend a lease this owner still holds. Returns false once another owner
+   * has taken it over; an expired lease nobody else claimed is still ours.
+   */
+  renewLock(name: string, owner: string, ttlMs: number): boolean {
+    const result = this.db.prepare('UPDATE locks SET expires_at = ? WHERE name = ? AND owner = ?').run(this.now() + ttlMs, name, owner);
+    return result.changes === 1;
+  }
+
+  holdsLock(name: string, owner: string): boolean {
+    return this.db.prepare('SELECT 1 FROM locks WHERE name = ? AND owner = ?').get(name, owner) !== undefined;
   }
 
   releaseLock(name: string, owner: string): void {

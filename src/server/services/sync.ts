@@ -60,7 +60,7 @@ export async function syncGmail(options: {
   }
   const client = options.client ?? connection.client(account.id);
 
-  return withLock(store, `sync:${account.id}`, async () => {
+  return withLock(store, `sync:${account.id}`, async (lease) => {
     const runId = store.startRun(account.id, 'sync');
     const stats: SyncStats = { listed: 0, added: 0, refreshed: 0, failed: 0 };
     try {
@@ -68,14 +68,16 @@ export async function syncGmail(options: {
       stats.listed = refs.length;
       const known = store.existingExternalIds(account.id, refs.map((ref) => ref.id));
       await mapLimit(refs, FETCH_CONCURRENCY, async (ref) => {
+        lease.assertHeld();
         try {
           if (known.has(ref.id)) {
             const minimal = await client.getMessageMinimal(ref.id);
-            store.updateMessageLabels(account.id, ref.id, minimal.labelIds);
+            lease.commit(() => store.updateMessageLabels(account.id, ref.id, minimal.labelIds));
             stats.refreshed += 1;
           } else {
             const full = await client.getMessageFull(ref.id);
-            if (store.insertMessage(parseGmailMessage(account.id, full)) !== null) stats.added += 1;
+            const parsed = parseGmailMessage(account.id, full);
+            if (lease.commit(() => store.insertMessage(parsed)) !== null) stats.added += 1;
           }
         } catch (error) {
           if (error instanceof AppError) throw error;

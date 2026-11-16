@@ -20,6 +20,12 @@ export type ListQuery = z.infer<typeof ListQuerySchema>;
 export interface DecisionView {
   state: DecisionState;
   source: EffectiveDecision['source'];
+  /** Classification or correction id the values come from; `basedOnClassificationId` for an accept. */
+  sourceId: number | null;
+  /** Send back as `expectedDecisionSeq` with a correction. */
+  decisionSeq: number;
+  /** Configuration revision this view was computed for; send back as `expectedTaxonomyRevision`. */
+  taxonomyRevision: number;
   category: string | null;
   action: string | null;
   priority: string | null;
@@ -29,10 +35,13 @@ export interface DecisionView {
   staleRevision: number | null;
 }
 
-function decisionView(decision: EffectiveDecision): DecisionView {
+function decisionView(decision: EffectiveDecision, taxonomyRevision: number): DecisionView {
   return {
     state: decision.state,
     source: decision.source,
+    sourceId: decision.sourceId,
+    decisionSeq: decision.decisionSeq,
+    taxonomyRevision,
     category: decision.category,
     action: decision.action,
     priority: decision.priority,
@@ -53,7 +62,7 @@ function decisionsFor(store: Store, messages: StoredMessage[]) {
   const ids = messages.map((message) => message.id);
   const classifications = store.latestClassifications(ids);
   const corrections = store.latestCorrections(ids);
-  return new Map(
+  const decisions = new Map(
     messages.map((message) => [
       message.id,
       effectiveDecision({
@@ -66,11 +75,12 @@ function decisionsFor(store: Store, messages: StoredMessage[]) {
       }),
     ]),
   );
+  return { revision, decisions };
 }
 
 export function listMessages(store: Store, account: Account, query: ListQuery) {
   const all = store.listMessages(account.id, LIST_SCAN_LIMIT);
-  const decisions = decisionsFor(store, all);
+  const { revision, decisions } = decisionsFor(store, all);
   const cache = store.labelCache(account.id);
   const needle = query.q?.toLowerCase();
 
@@ -112,13 +122,14 @@ export function listMessages(store: Store, account: Account, query: ListQuery) {
       unread: message.unread,
       labels: labelNames(message, cache),
       lastError: message.lastError,
-      decision: decisionView(decisions.get(message.id)!),
+      decision: decisionView(decisions.get(message.id)!, revision),
     })),
   };
 }
 
 export function messageDetail(store: Store, account: Account, message: StoredMessage) {
-  const decision = decisionsFor(store, [message]).get(message.id)!;
+  const { revision, decisions } = decisionsFor(store, [message]);
+  const decision = decisions.get(message.id)!;
   const history = store.history(message.id);
   const cache = store.labelCache(account.id);
   return {
@@ -136,7 +147,7 @@ export function messageDetail(store: Store, account: Account, message: StoredMes
     signals: message.signals,
     labels: labelNames(message, cache),
     lastError: message.lastError,
-    decision: decisionView(decision),
+    decision: decisionView(decision, revision),
     history: {
       classifications: history.classifications.map((c) => ({
         id: c.id,

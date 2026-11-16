@@ -1,9 +1,20 @@
 import { z } from 'zod';
 import type { FetchLike } from '../../providers/http.js';
 import { parseRetryAfter } from '../../providers/http.js';
-import type { GmailPart } from './mime.js';
+import { BodyTooLargeError, readBoundedText } from '../http/bounded-body.js';
+import { prunePartTree, type GmailPart } from './mime.js';
 
 export const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
+/**
+ * Largest format=full message response read, in bytes. Inline part data is
+ * base64url inside JSON; attachments arrive as ids and do not count. Larger
+ * messages fail individually; only the first MAX_PART_BYTES of a body is kept anyway.
+ */
+export const MAX_FULL_MESSAGE_BYTES = 4 * 1024 * 1024;
+/** Largest response read for every other Gmail call (profile, lists, labels, modify). */
+export const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+/** Error bodies are only read for their reason code. */
+export const MAX_ERROR_BODY_BYTES = 64 * 1024;
 const GMAIL_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 export class GmailApiError extends Error {
@@ -102,7 +113,9 @@ export class GmailClient {
   }
 
   async getMessageFull(id: string): Promise<GmailFullMessage> {
-    const message = FullMessageSchema.parse(await this.request('GET', `/messages/${this.id(id)}?format=full`));
+    const raw = await this.request('GET', `/messages/${this.id(id)}?format=full`, undefined, MAX_FULL_MESSAGE_BYTES);
+    if (raw && typeof raw === 'object' && 'payload' in raw) (raw as { payload: unknown }).payload = prunePartTree(raw.payload);
+    const message = FullMessageSchema.parse(raw);
     this.assertSameId(id, message.id);
     return message;
   }
@@ -141,7 +154,7 @@ export class GmailClient {
     if (requested !== returned) throw new GmailApiError(502, 'id_mismatch', 'Gmail returned a different message than requested');
   }
 
-  private async request(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
+  private async request(method: 'GET' | 'POST', path: string, body?: unknown, maxBytes = MAX_RESPONSE_BYTES): Promise<unknown> {
     let refreshed = false;
     for (let attempt = 0; ; attempt += 1) {
       const token = await this.options.tokens.get();
@@ -166,7 +179,15 @@ export class GmailClient {
         throw new GmailApiError(0, 'network', 'Could not reach Gmail');
       }
       if (response.ok) {
-        const text = await response.text();
+        let text: string;
+        try {
+          text = await readBoundedText(response, maxBytes);
+        } catch (error) {
+          if (error instanceof BodyTooLargeError) {
+            throw new GmailApiError(502, 'too_large', `Gmail response is larger than ${Math.round(maxBytes / 1024)} KiB; skipped`);
+          }
+          throw new GmailApiError(0, 'network', 'Gmail response was interrupted');
+        }
         try {
           return JSON.parse(text) as unknown;
         } catch {
@@ -191,7 +212,8 @@ export class GmailClient {
 
   private async reasonOf(response: Response): Promise<string | undefined> {
     try {
-      const body = (await response.json()) as { error?: { status?: string; errors?: Array<{ reason?: string }> } };
+      const text = await readBoundedText(response, MAX_ERROR_BODY_BYTES);
+      const body = JSON.parse(text) as { error?: { status?: string; errors?: Array<{ reason?: string }> } };
       const reason = body.error?.errors?.[0]?.reason ?? body.error?.status;
       return typeof reason === 'string' && /^[A-Za-z_]{1,64}$/.test(reason) ? reason : undefined;
     } catch {

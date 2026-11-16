@@ -100,17 +100,29 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   if (password !== undefined && password.length < MIN_APP_PASSWORD_LENGTH) {
     throw new ConfigError(`APP_PASSWORD must be at least ${MIN_APP_PASSWORD_LENGTH} characters`);
   }
-  if (!loopback && !password) {
-    throw new ConfigError(
-      `Refusing to listen on ${e.HOST} without APP_PASSWORD. Non-loopback binds require authentication; set APP_PASSWORD and serve over HTTPS.`,
-    );
-  }
-
   const displayHost = e.HOST === '0.0.0.0' || e.HOST === '::' ? 'localhost' : e.HOST.includes(':') ? `[${e.HOST}]` : e.HOST;
   const publicUrl = new URL(e.PUBLIC_URL ?? `http://${displayHost}:${e.PORT}`);
   if (!['http:', 'https:'].includes(publicUrl.protocol)) throw new ConfigError('PUBLIC_URL must be http or https');
   if (!isLoopbackHost(publicUrl.hostname.replace(/^\[|\]$/g, '')) && publicUrl.protocol !== 'https:') {
     throw new ConfigError('PUBLIC_URL must use https when it is not a loopback address');
+  }
+  // Local sessions are only safe when nothing but this machine can reach the
+  // app. A public PUBLIC_URL means a reverse proxy forwards outside requests
+  // to the loopback bind, so Origin and socket address prove nothing.
+  if (!password) {
+    if (!loopback) {
+      throw new ConfigError(
+        `Refusing to listen on ${e.HOST} without APP_PASSWORD. Non-loopback binds require authentication; set APP_PASSWORD and serve over HTTPS.`,
+      );
+    }
+    if (!isLoopbackHost(publicUrl.hostname.replace(/^\[|\]$/g, ''))) {
+      throw new ConfigError(
+        `PUBLIC_URL ${publicUrl.origin} is not a loopback address. Servers reachable through a reverse proxy require APP_PASSWORD.`,
+      );
+    }
+    if (e.TRUST_PROXY) {
+      throw new ConfigError('TRUST_PROXY requires APP_PASSWORD. Local sessions without a password are only for loopback-only servers.');
+    }
   }
 
   const allowedHosts = new Set<string>([publicUrl.host]);

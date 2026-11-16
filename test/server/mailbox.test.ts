@@ -22,6 +22,22 @@ async function firstMessageId(client: Client, subject: string): Promise<number> 
   return list.body.messages.find((m: { subject: string }) => m.subject === subject).id;
 }
 
+/** The fields a correction must echo back from the message's decision view. */
+async function reviewed(client: Client, id: number, mailbox = 'gmail') {
+  const detail = await client.get(`/api/mailboxes/${mailbox}/messages/${id}`);
+  const { taxonomyRevision, decisionSeq, sourceId, source } = detail.body.decision;
+  return {
+    expectedTaxonomyRevision: taxonomyRevision as number,
+    expectedDecisionSeq: decisionSeq as number,
+    classificationId: source === 'model' ? (sourceId as number) : null,
+  };
+}
+
+async function edit(client: Client, id: number, values: { category: string; action: string; priority: string }, mailbox = 'gmail') {
+  const { classificationId: _ignored, ...expected } = await reviewed(client, id, mailbox);
+  return client.post(`/api/mailboxes/${mailbox}/messages/${id}/corrections`, { kind: 'edit', ...expected, ...values });
+}
+
 async function readyMessage(h: Harness, client: Client) {
   await client.post('/api/mailboxes/gmail/sync');
   await client.post('/api/mailboxes/gmail/classify', {});
@@ -135,16 +151,12 @@ describe('classification runs', () => {
     expect(detail.body.decision.state).toBe('needs_review');
     expect(detail.body.decision.reviewReasons[0]).toMatch(/confidence 0\.30/);
 
-    const corrected = await client.post(`/api/mailboxes/gmail/messages/${id}/corrections`, {
-      kind: 'edit',
-      category: 'notification',
-      action: 'needs_action',
-      priority: 'high',
-    });
+    const corrected = await edit(client, id, { category: 'notification', action: 'needs_action', priority: 'high' });
     expect(corrected.body.decision).toMatchObject({ state: 'confirmed', source: 'human', category: 'notification' });
     expect(corrected.body.history.corrections).toHaveLength(1);
-    const bad = await client.post(`/api/mailboxes/gmail/messages/${id}/corrections`, { kind: 'edit', category: 'nope', action: 'needs_action', priority: 'high' });
+    const bad = await edit(client, id, { category: 'nope', action: 'needs_action', priority: 'high' });
     expect(bad.status).toBe(400);
+    expect(bad.body.error.code).toBe('unknown_category');
   });
 
   it('marks decisions stale after a configuration change and reclassifies safely', async () => {
@@ -238,7 +250,7 @@ describe('label preview and apply', () => {
     const { h, client } = await connected();
     const id = await readyMessage(h, client);
     const preview = await client.post(`/api/mailboxes/gmail/messages/${id}/label-preview`);
-    await client.post(`/api/mailboxes/gmail/messages/${id}/corrections`, { kind: 'edit', category: 'fyi', action: 'no_action', priority: 'low' });
+    expect((await edit(client, id, { category: 'fyi', action: 'no_action', priority: 'low' })).status).toBe(200);
     const afterCorrection = await client.post('/api/mailboxes/gmail/apply', { previewId: preview.body.previewId });
     expect(afterCorrection.body.error.code).toBe('stale_decision');
 
@@ -337,7 +349,7 @@ describe('label preview and apply', () => {
     const list = await client.get('/api/mailboxes/demo/messages');
     const id = list.body.messages[0].id;
     expect(list.body.messages[0].decision.state).toBe('needs_review');
-    await client.post(`/api/mailboxes/demo/messages/${id}/corrections`, { kind: 'accept', category: 'fyi', action: 'needs_response', priority: 'high' });
+    expect((await edit(client, id, { category: 'fyi', action: 'needs_response', priority: 'high' }, 'demo')).status).toBe(200);
     const preview = await client.post(`/api/mailboxes/demo/messages/${id}/label-preview`);
     expect(preview.body).toMatchObject({ canApply: true, simulated: true });
     const apply = await client.post('/api/mailboxes/demo/apply', { previewId: preview.body.previewId });
@@ -345,5 +357,285 @@ describe('label preview and apply', () => {
     const detail = await client.get(`/api/mailboxes/demo/messages/${id}`);
     expect(detail.body.labels).toContain('Mail Triage/Category/FYI');
     expect(h.google.calls).toHaveLength(0);
+  });
+});
+
+/** A model whose answers wait until `release()`; `started` counts calls in flight or done. */
+function deferredModel() {
+  const model = new ScriptedModel();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const state = { started: 0 };
+  const original = model.classify.bind(model);
+  model.classify = async (request) => {
+    state.started += 1;
+    await gate;
+    return original(request);
+  };
+  const waitForCalls = async (n: number) => {
+    for (let i = 0; i < 200 && state.started < n; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(state.started).toBe(n);
+  };
+  return { model, release: () => release(), waitForCalls };
+}
+
+const answered = (value: string) => ({ status: 'answered' as const, value, confidence: 0.95, selectedProbability: 0.97, probabilities: null });
+
+describe('model results that finish after a newer decision', () => {
+  it('keeps a correction saved while the model was running, and later previews bind to it', async () => {
+    const deferred = deferredModel();
+    const { h, client } = await connected({ model: deferred.model });
+    await client.post('/api/mailboxes/gmail/sync');
+    const id = await firstMessageId(client, 'Deploy failed on main');
+    deferred.model.next = () => ({ category: answered('fyi'), action: answered('needs_response'), priority: answered('high') });
+
+    const classifying = client.post(`/api/mailboxes/gmail/messages/${id}/classify`).then((r) => r);
+    await deferred.waitForCalls(1);
+    const correction = await edit(client, id, { category: 'marketing', action: 'no_action', priority: 'low' });
+    expect(correction.status).toBe(200);
+    deferred.release();
+
+    const late = await classifying;
+    expect(late.status).toBe(200);
+    expect(late.body.outcome).toBe('superseded');
+    expect(late.body.decision).toMatchObject({ state: 'confirmed', source: 'human', category: 'marketing', action: 'no_action', priority: 'low' });
+    expect(late.body.history.classifications).toHaveLength(0);
+
+    const preview = await client.post(`/api/mailboxes/gmail/messages/${id}/label-preview`);
+    expect(preview.body.decision).toMatchObject({ source: 'human', category: 'marketing' });
+    const apply = await client.post('/api/mailboxes/gmail/apply', { previewId: preview.body.previewId });
+    expect(apply.body.status).toBe('applied');
+    expect(h.google.labelNamesOf('m1')).toContain('Mail Triage/Category/Marketing');
+    expect(h.google.labelNamesOf('m1')).not.toContain('Mail Triage/Category/FYI');
+
+    // Reclassifying after the correction is an explicit request and does replace it.
+    const again = await client.post(`/api/mailboxes/gmail/messages/${id}/classify`);
+    expect(again.body).toMatchObject({ outcome: 'classified', decision: { source: 'model', category: 'fyi' } });
+  });
+
+  it('counts superseded messages in a batch run and keeps the human decision', async () => {
+    const deferred = deferredModel();
+    const { h, client } = await connected({ model: deferred.model });
+    await client.post('/api/mailboxes/gmail/sync');
+    const id = await firstMessageId(client, 'Your receipt');
+    const run = client.post('/api/mailboxes/gmail/classify', {}).then((r) => r);
+    await deferred.waitForCalls(3);
+    expect((await edit(client, id, { category: 'receipt', action: 'no_action', priority: 'low' })).status).toBe(200);
+    deferred.release();
+
+    const result = await run;
+    expect(result.body).toMatchObject({ attempted: 3, classified: 2, superseded: 1, failed: 0, remaining: 0 });
+    const lastRun = h.store.lastRun(h.store.getGmailAccount()!.id, 'classify')!;
+    expect(lastRun).toMatchObject({ status: 'ok', stats: { attempted: 3, classified: 2, superseded: 1 } });
+    const detail = await client.get(`/api/mailboxes/gmail/messages/${id}`);
+    expect(detail.body.decision).toMatchObject({ source: 'human', category: 'receipt' });
+  });
+
+  it('discards a result computed for a configuration that changed during inference', async () => {
+    const deferred = deferredModel();
+    const { client } = await connected({ model: deferred.model });
+    await client.post('/api/mailboxes/gmail/sync');
+    const id = await firstMessageId(client, 'Deploy failed on main');
+    const classifying = client.post(`/api/mailboxes/gmail/messages/${id}/classify`).then((r) => r);
+    await deferred.waitForCalls(1);
+    const update = await client.put('/api/taxonomy', { expectedRevision: 1, taxonomy: { ...DEFAULT_TAXONOMY, userContext: 'New context' } });
+    expect(update.body.revision).toBe(2);
+    deferred.release();
+
+    const late = await classifying;
+    expect(late.body.outcome).toBe('superseded');
+    expect(late.body.decision).toMatchObject({ state: 'unclassified', taxonomyRevision: 2 });
+    expect(late.body.history.classifications).toHaveLength(0);
+  });
+});
+
+describe('corrections are bound to what the reviewer saw', () => {
+  async function needsReview() {
+    const ctx = await connected();
+    ctx.h.model.next = () => ({
+      category: { status: 'answered', value: 'marketing', confidence: 0.3, selectedProbability: 0.5, probabilities: null },
+    });
+    const id = await readyMessage(ctx.h, ctx.client);
+    return { ...ctx, id };
+  }
+  const corrections = (client: Client, id: number, body: Record<string, unknown>) =>
+    client.post(`/api/mailboxes/gmail/messages/${id}/corrections`, body);
+
+  it('accepts exactly the reviewed classification and stores its values', async () => {
+    const { client, id } = await needsReview();
+    const seen = await reviewed(client, id);
+    expect(seen).toMatchObject({ expectedTaxonomyRevision: 1, expectedDecisionSeq: 1 });
+    const accepted = await corrections(client, id, {
+      kind: 'accept',
+      expectedTaxonomyRevision: seen.expectedTaxonomyRevision,
+      expectedDecisionSeq: seen.expectedDecisionSeq,
+      basedOnClassificationId: seen.classificationId,
+    });
+    expect(accepted.status).toBe(200);
+    expect(accepted.body.decision).toMatchObject({ state: 'confirmed', source: 'human', category: 'marketing', action: 'needs_action', priority: 'high', decisionSeq: 2 });
+    expect(accepted.body.history.corrections[0]).toMatchObject({ kind: 'accept', taxonomyRevision: 1, basedOnClassificationId: seen.classificationId });
+  });
+
+  it('rejects an accept that claims values the model did not give', async () => {
+    const { client, id } = await needsReview();
+    const seen = await reviewed(client, id);
+    const response = await corrections(client, id, {
+      kind: 'accept',
+      expectedTaxonomyRevision: seen.expectedTaxonomyRevision,
+      expectedDecisionSeq: seen.expectedDecisionSeq,
+      basedOnClassificationId: seen.classificationId,
+      category: 'fyi',
+      action: 'needs_action',
+      priority: 'high',
+    });
+    expect(response.status).toBe(409);
+    expect(response.body.error).toMatchObject({ code: 'accept_mismatch', details: { field: 'category', expected: 'marketing' } });
+    // Matching values are fine.
+    const matching = await corrections(client, id, {
+      kind: 'accept',
+      expectedTaxonomyRevision: seen.expectedTaxonomyRevision,
+      expectedDecisionSeq: seen.expectedDecisionSeq,
+      basedOnClassificationId: seen.classificationId,
+      category: 'marketing',
+      action: 'needs_action',
+      priority: 'high',
+    });
+    expect(matching.status).toBe(200);
+  });
+
+  it('rejects a stale accept or edit after the configuration changes, and labels stay blocked', async () => {
+    const { client, id } = await needsReview();
+    const seen = await reviewed(client, id);
+    await client.put('/api/taxonomy', { expectedRevision: 1, taxonomy: { ...DEFAULT_TAXONOMY, userContext: 'I moved teams.' } });
+
+    const accept = await corrections(client, id, {
+      kind: 'accept',
+      expectedTaxonomyRevision: 1,
+      expectedDecisionSeq: seen.expectedDecisionSeq,
+      basedOnClassificationId: seen.classificationId,
+      category: 'marketing',
+      action: 'needs_action',
+      priority: 'high',
+    });
+    expect(accept.status).toBe(409);
+    expect(accept.body.error).toMatchObject({ code: 'stale_revision', details: { current: 2 } });
+    const editOld = await corrections(client, id, {
+      kind: 'edit',
+      expectedTaxonomyRevision: 1,
+      expectedDecisionSeq: seen.expectedDecisionSeq,
+      category: 'fyi',
+      action: 'no_action',
+      priority: 'low',
+    });
+    expect(editOld.body.error.code).toBe('stale_revision');
+
+    // An accept built for revision 2 still cannot accept a revision 1 classification.
+    const relabeled = await corrections(client, id, {
+      kind: 'accept',
+      expectedTaxonomyRevision: 2,
+      expectedDecisionSeq: seen.expectedDecisionSeq,
+      basedOnClassificationId: seen.classificationId,
+    });
+    expect(relabeled.body.error.code).toBe('classification_mismatch');
+
+    const detail = await client.get(`/api/mailboxes/gmail/messages/${id}`);
+    expect(detail.body.decision).toMatchObject({ state: 'stale', taxonomyRevision: 2 });
+    expect(detail.body.history.corrections).toHaveLength(0);
+    expect((await client.post(`/api/mailboxes/gmail/messages/${id}/label-preview`)).body.canApply).toBe(false);
+
+    // An edit made against the current revision is the way to confirm it now.
+    const fresh = await edit(client, id, { category: 'fyi', action: 'no_action', priority: 'low' });
+    expect(fresh.body.decision).toMatchObject({ state: 'confirmed', category: 'fyi', taxonomyRevision: 2 });
+  });
+
+  it('rejects accepts and edits made against an older decision sequence', async () => {
+    const { h, client, id } = await needsReview();
+    const seen = await reviewed(client, id);
+    h.model.next = () => ({ category: answered('notification') });
+    await client.post(`/api/mailboxes/gmail/messages/${id}/classify`);
+
+    const accept = await corrections(client, id, {
+      kind: 'accept',
+      expectedTaxonomyRevision: seen.expectedTaxonomyRevision,
+      expectedDecisionSeq: seen.expectedDecisionSeq,
+      basedOnClassificationId: seen.classificationId,
+    });
+    expect(accept.status).toBe(409);
+    expect(accept.body.error).toMatchObject({ code: 'stale_decision', details: { currentDecisionSeq: 2 } });
+    const editOld = await corrections(client, id, {
+      kind: 'edit',
+      expectedTaxonomyRevision: seen.expectedTaxonomyRevision,
+      expectedDecisionSeq: seen.expectedDecisionSeq,
+      category: 'fyi',
+      action: 'no_action',
+      priority: 'low',
+    });
+    expect(editOld.body.error.code).toBe('stale_decision');
+
+    // The superseded classification cannot be accepted even with the current sequence.
+    const older = await corrections(client, id, {
+      kind: 'accept',
+      expectedTaxonomyRevision: seen.expectedTaxonomyRevision,
+      expectedDecisionSeq: 2,
+      basedOnClassificationId: seen.classificationId,
+    });
+    expect(older.body.error.code).toBe('not_acceptable');
+    expect((await client.get(`/api/mailboxes/gmail/messages/${id}`)).body.history.corrections).toHaveLength(0);
+  });
+
+  it('rejects classification ids from another message or mailbox', async () => {
+    const { h, client, id } = await needsReview();
+    const seen = await reviewed(client, id);
+    const otherId = await firstMessageId(client, 'Weekly digest');
+    const other = await reviewed(client, otherId);
+    await client.post('/api/mailboxes/demo/classify', {});
+    const demoId = (await client.get('/api/mailboxes/demo/messages')).body.messages[0].id;
+    const demo = await reviewed(client, demoId, 'demo');
+    expect(demo.classificationId).not.toBeNull();
+
+    for (const foreign of [other.classificationId, demo.classificationId, 999_999]) {
+      const accept = await corrections(client, id, {
+        kind: 'accept',
+        expectedTaxonomyRevision: seen.expectedTaxonomyRevision,
+        expectedDecisionSeq: seen.expectedDecisionSeq,
+        basedOnClassificationId: foreign,
+      });
+      expect(accept.status).toBe(409);
+      expect(accept.body.error.code).toBe('classification_mismatch');
+      const editWith = await corrections(client, id, {
+        kind: 'edit',
+        expectedTaxonomyRevision: seen.expectedTaxonomyRevision,
+        expectedDecisionSeq: seen.expectedDecisionSeq,
+        basedOnClassificationId: foreign,
+        category: 'fyi',
+        action: 'no_action',
+        priority: 'low',
+      });
+      expect(editWith.body.error.code).toBe('classification_mismatch');
+    }
+    expect(h.store.latestCorrections([id, otherId]).size).toBe(0);
+  });
+
+  it('refuses to accept an incomplete prediction and requires the review fields', async () => {
+    const { h, client } = await connected();
+    h.model.next = () => ({ action: { status: 'refused' } });
+    const id = await readyMessage(h, client);
+    const seen = await reviewed(client, id);
+    const accept = await corrections(client, id, {
+      kind: 'accept',
+      expectedTaxonomyRevision: seen.expectedTaxonomyRevision,
+      expectedDecisionSeq: seen.expectedDecisionSeq,
+      basedOnClassificationId: seen.classificationId,
+    });
+    expect(accept.status).toBe(409);
+    expect(accept.body.error.code).toBe('not_acceptable');
+
+    const legacy = await corrections(client, id, { kind: 'accept', category: 'notification', action: 'needs_action', priority: 'high', basedOnClassificationId: seen.classificationId });
+    expect(legacy.status).toBe(400);
+    expect(legacy.body.error.code).toBe('invalid_request');
+    const noBasis = await corrections(client, id, { kind: 'accept', expectedTaxonomyRevision: 1, expectedDecisionSeq: 1 });
+    expect(noBasis.status).toBe(400);
+    const typo = await corrections(client, id, { kind: 'edit', expectedRevision: 1, expectedDecisionSeq: 1, category: 'fyi', action: 'no_action', priority: 'low' });
+    expect(typo.status).toBe(400);
   });
 });

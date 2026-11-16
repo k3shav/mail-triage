@@ -10,6 +10,27 @@ describe('startup configuration', () => {
     expect(loadConfig({ HOST: '0.0.0.0', APP_PASSWORD: 'correct horse battery', PUBLIC_URL: 'https://mail.example.com' }).auth.mode).toBe('password');
   });
 
+  it('requires a password when a public URL or proxy puts a loopback bind on the network', () => {
+    // A reverse proxy forwarding https://mail.example.com to 127.0.0.1 makes the app public.
+    expect(() => loadConfig({ HOST: '127.0.0.1', PUBLIC_URL: 'https://mail.example.com', DEMO_INBOX: 'false' })).toThrow(/APP_PASSWORD/);
+    expect(() => loadConfig({ HOST: '::1', PUBLIC_URL: 'https://mail.example.com' })).toThrow(/APP_PASSWORD/);
+    expect(() => loadConfig({ HOST: '127.0.0.1', TRUST_PROXY: 'true' })).toThrow(/TRUST_PROXY requires APP_PASSWORD/);
+    expect(() => loadConfig({ PUBLIC_URL: 'http://localhost:8787', TRUST_PROXY: 'true' })).toThrow(/TRUST_PROXY/);
+
+    const proxied = loadConfig({
+      HOST: '127.0.0.1',
+      PUBLIC_URL: 'https://mail.example.com',
+      APP_PASSWORD: 'correct horse battery',
+      TRUST_PROXY: 'true',
+    });
+    expect(proxied).toMatchObject({ auth: { mode: 'password' }, trustProxy: true, secureCookies: true });
+    expect(proxied.allowedHosts.has('mail.example.com')).toBe(true);
+
+    for (const local of [{}, { PUBLIC_URL: 'http://localhost:8787' }, { PUBLIC_URL: 'http://127.0.0.1:8787' }, { PUBLIC_URL: 'http://[::1]:8787' }]) {
+      expect(loadConfig(local).auth.mode).toBe('local');
+    }
+  });
+
   it('rejects short passwords, plain-http public URLs, and cross-origin redirect URIs', () => {
     expect(() => loadConfig({ APP_PASSWORD: 'short' })).toThrow(/12 characters/);
     expect(() => loadConfig({ HOST: '0.0.0.0', APP_PASSWORD: 'correct horse battery', PUBLIC_URL: 'http://mail.example.com' })).toThrow(/https/);
@@ -88,6 +109,29 @@ describe('HTTP protections', () => {
     expect(String(ok.headers['set-cookie'])).toMatch(/__Host-mail_triage_session=.*Secure/);
     for (let i = 0; i < 10; i += 1) expect((await post({ password: 'wrong' })).status).toBe(401);
     expect((await post({ password: 'correct horse battery' })).status).toBe(429);
+  });
+
+  it('gives proxied visitors no local session; they sign in with the password', async () => {
+    const { app } = createHarness({
+      env: { HOST: '127.0.0.1', PUBLIC_URL: 'https://mail.example.com', APP_PASSWORD: 'correct horse battery', TRUST_PROXY: 'true' },
+    });
+    // What the proxy forwards for a browser visiting the public origin.
+    const proxied = (req: request.Test) =>
+      req.set('Host', 'mail.example.com').set('Origin', 'https://mail.example.com').set('X-Forwarded-For', '203.0.113.9');
+    const local = await proxied(request(app).post('/api/session/local'));
+    expect(local.status).toBe(403);
+    expect(local.body.error.code).toBe('password_required');
+    expect(local.headers['set-cookie']).toBeUndefined();
+    expect((await proxied(request(app).get('/api/status'))).status).toBe(401);
+
+    const login = await proxied(request(app).post('/api/session/login')).send({ password: 'correct horse battery' });
+    expect(login.status).toBe(200);
+    // Sign-in clears any earlier cookie first; the last Set-Cookie is the new session.
+    const cookie = ([] as string[]).concat(login.headers['set-cookie'] ?? []).at(-1)!.split(';')[0]!;
+    expect(cookie).toMatch(/^__Host-mail_triage_session=/);
+    const status = await proxied(request(app).get('/api/status')).set('Cookie', cookie);
+    expect(status.status).toBe(200);
+    expect(status.body.auth.mode).toBe('password');
   });
 
   it('bounds request bodies', async () => {

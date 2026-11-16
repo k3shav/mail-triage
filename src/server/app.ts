@@ -3,7 +3,7 @@ import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { z, ZodError } from 'zod';
 import { ReviewPolicySchema } from '../core/decision.js';
-import { ACTIONS, PRIORITIES, TaxonomySchema, isValidOptionId } from '../core/taxonomy.js';
+import { ACTIONS, PRIORITIES, TaxonomySchema } from '../core/taxonomy.js';
 import type { FetchLike } from '../providers/http.js';
 import type { ModelSetup } from '../providers/registry.js';
 import { requestedScopes, type AppConfig } from './config.js';
@@ -61,13 +61,36 @@ export function createContext(deps: AppDeps): AppContext {
 
 const MailboxSchema = z.enum(['demo', 'gmail']);
 const IdSchema = z.coerce.number().int().positive();
-const CorrectionSchema = z.object({
-  kind: z.enum(['accept', 'edit']),
-  category: z.string().max(40),
-  action: z.enum(ACTIONS.map((a) => a.id) as [string, ...string[]]),
-  priority: z.enum(PRIORITIES.map((p) => p.id) as [string, ...string[]]),
-  basedOnClassificationId: z.number().int().positive().nullable().default(null),
-});
+const ActionSchema = z.enum(ACTIONS.map((a) => a.id) as [string, ...string[]]);
+const PrioritySchema = z.enum(PRIORITIES.map((p) => p.id) as [string, ...string[]]);
+/**
+ * Corrections state what the reviewer saw: `expectedTaxonomyRevision` and
+ * `expectedDecisionSeq` come from the message's `decision` view. An accept
+ * names the reviewed classification and takes its values from it; values
+ * sent with an accept must match. An edit sends all three values.
+ */
+const ReviewedSchema = {
+  expectedTaxonomyRevision: z.number().int().positive(),
+  expectedDecisionSeq: z.number().int().min(0),
+};
+const CorrectionSchema = z.discriminatedUnion('kind', [
+  z.strictObject({
+    kind: z.literal('accept'),
+    ...ReviewedSchema,
+    basedOnClassificationId: z.number().int().positive(),
+    category: z.string().max(40).optional(),
+    action: ActionSchema.optional(),
+    priority: PrioritySchema.optional(),
+  }),
+  z.strictObject({
+    kind: z.literal('edit'),
+    ...ReviewedSchema,
+    basedOnClassificationId: z.number().int().positive().nullable().default(null),
+    category: z.string().max(40),
+    action: ActionSchema,
+    priority: PrioritySchema,
+  }),
+]);
 const TaxonomyUpdateSchema = z.object({ expectedRevision: z.number().int().positive(), taxonomy: TaxonomySchema });
 const ClassifyBodySchema = z.object({ limit: z.number().int().min(1).max(100).optional() });
 const ApplySchema = z.object({ previewId: z.string().regex(/^pv_[A-Za-z0-9_-]{10,64}$/) });
@@ -271,8 +294,8 @@ export function createApp(deps: AppDeps): { app: express.Express; context: AppCo
     const account = mailbox(req.params.mailbox);
     const message = store.getMessage(account.id, IdSchema.parse(req.params.id));
     if (!message) throw notFound('Message');
-    await classifier.classifyOne(account, message);
-    res.json(messageDetail(store, account, store.getMessage(account.id, message.id)!));
+    const outcome = await classifier.classifyOne(account, message);
+    res.json({ ...messageDetail(store, account, store.getMessage(account.id, message.id)!), outcome });
   });
 
   api.post('/mailboxes/:mailbox/messages/:id/corrections', (req, res) => {
@@ -280,11 +303,7 @@ export function createApp(deps: AppDeps): { app: express.Express; context: AppCo
     const message = store.getMessage(account.id, IdSchema.parse(req.params.id));
     if (!message) throw notFound('Message');
     const body = CorrectionSchema.parse(req.body);
-    const { revision, taxonomy } = store.currentTaxonomy();
-    if (!isValidOptionId(taxonomy, 'category', body.category)) {
-      throw new AppError(400, 'unknown_category', 'That category does not exist in the current configuration');
-    }
-    store.insertCorrection({ accountId: account.id, messageId: message.id, taxonomyRevision: revision, ...body });
+    store.insertCorrection({ accountId: account.id, messageId: message.id, ...body });
     res.json(messageDetail(store, account, store.getMessage(account.id, message.id)!));
   });
 

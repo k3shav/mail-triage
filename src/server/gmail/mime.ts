@@ -4,8 +4,10 @@ import type { MessageSignals } from '../db/store.js';
 export const MAX_PART_BYTES = 512 * 1024;
 /** Characters of body text stored per message. */
 export const MAX_STORED_BODY_CHARS = 64 * 1024;
-const MAX_PARTS = 200;
-const MAX_DEPTH = 12;
+/** Parts (including multipart containers) visited per message, depth first. */
+export const MAX_PARTS = 200;
+/** Nesting depth below the root part that is still read. */
+export const MAX_DEPTH = 12;
 
 export interface GmailHeader {
   name: string;
@@ -81,6 +83,50 @@ function collect(root: GmailPart): { plain?: GmailPart; html?: GmailPart } {
   };
   walk(root, 0);
   return found;
+}
+
+/**
+ * Copy of a raw Gmail payload holding only the parts `collect` can reach:
+ * the first MAX_PARTS in depth-first order and nothing deeper than
+ * MAX_DEPTH. Iterative, so a hostile nesting depth cannot overflow the stack
+ * of the recursive schema check that runs on the result.
+ */
+export function prunePartTree(root: unknown): unknown {
+  if (!isPlainObject(root)) return root;
+  type Frame = { source: unknown; depth: number; into: unknown[] | null };
+  const shallow = (node: Record<string, unknown>) => {
+    const { parts: _parts, ...rest } = node;
+    return rest;
+  };
+  let result: unknown = root;
+  let kept = 0;
+  const stack: Frame[] = [{ source: root, depth: 0, into: null }];
+  while (stack.length > 0 && kept < MAX_PARTS) {
+    const { source, depth, into } = stack.pop()!;
+    if (!isPlainObject(source)) {
+      // Left for the schema check to reject.
+      into?.push(source);
+      continue;
+    }
+    const copy: Record<string, unknown> = shallow(source);
+    kept += 1;
+    if (into) into.push(copy);
+    else result = copy;
+    const children = source.parts;
+    if (children === undefined) continue;
+    if (!Array.isArray(children)) {
+      copy.parts = children;
+      continue;
+    }
+    copy.parts = [];
+    if (depth >= MAX_DEPTH) continue;
+    for (let i = children.length - 1; i >= 0; i -= 1) stack.push({ source: children[i], depth: depth + 1, into: copy.parts as unknown[] });
+  }
+  return result;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 const NAMED_ENTITIES: Record<string, string> = {
