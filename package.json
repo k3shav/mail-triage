@@ -1,0 +1,29 @@
+{
+  "name": "mail-triage",
+  "version": "0.1.0",
+  "description": "Gmail-first email classifier with configurable categories, separate action and priority decisions, and explicit review before labels change.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc -p tsconfig.build.json",
+    "classify": "tsx src/cli/classify-file.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.92",
+    "ai": "^7.0.173",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}

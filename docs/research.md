@@ -41,3 +41,27 @@ The user selected Gmail OAuth as the first connector. [Google's web-server OAuth
 The intended operation is an explicit preview followed by per-message application of namespaced labels using `addLabelIds` only. It does not change unread state, remove labels, archive, delete, or send. Never classify or modify the developer's own mailbox during automated verification.
 
 Mac and server runs share one runtime and persistent storage. Loopback is the local default; a remotely reachable server requires authentication and HTTPS termination. Email bodies are private local data; ignore database files and credentials in Git. Render plain text, with no remote image loading or email HTML execution.
+
+## Provider wire details used by the adapters
+
+Re-checked 16 November 2026 while implementing `src/providers/`. These are documentation facts; no live request was made to either service.
+
+| | Jev System One | OpenAI Decisions | OpenAI-compatible (AI SDK) |
+| --- | --- | --- | --- |
+| Endpoint | `POST https://api.typesafe.ai/v1/systemone` | `POST https://api.openai.com/v1/decisions` | `POST <base>/chat/completions` via `@ai-sdk/openai-compatible` |
+| Model | `jev-latest` alias; response `model` may name a concrete version | `gpt-6-luna` (the only documented model) | Operator-chosen local or hosted model |
+| Shared input | `state`: string, object, or array | `input`: string or message array; `input_json` parts carry JSON data in user messages | System instructions plus a user message |
+| Questions | Object keyed by name; choice uses `criteria: { option: description }` (1–255) | Array; choice uses `name` and `choices: [{ value, description }]` (2–255) | JSON schema with an enum per field (`Output.object`) |
+| Answers | Object keyed by question name: `choice`, `confidence`, `probabilities` map | Array in question order: `choice`, `confidence`, `probabilities` as `[{ value, probability }]`, or `{ type: "refusal", name }` | Generated object; no confidence or probabilities |
+| Confidence | Derived from the shape of `probabilities` (1 = all mass on one option, 0 = even split); separate from the selected option's probability | Separate `confidence` field next to the distribution; thresholds should be set from labeled data | None. Stored as null and routed to review by default |
+
+Sources: [System One reference](https://docs.typesafe.ai/api/system-one.md), [Choice](https://docs.typesafe.ai/primitives/choice.md), [Confidence](https://docs.typesafe.ai/confidence.md), [Decisions guide](https://developers.openai.com/api/docs/guides/decisions), [Create a decision reference](https://developers.openai.com/api/reference/resources/decisions/methods/create.md), [AI SDK OpenAI-compatible providers](https://ai-sdk.dev/providers/openai-compatible-providers).
+
+Implementation consequences:
+
+- The Jev reference documents 400/422 error bodies and no refusal answer type. The adapter still accepts `type: "refusal"` defensively and treats any other unexpected answer as invalid.
+- OpenAI refusals are per question; other answers in the same response remain usable.
+- Validation is strict: a confidence outside 0–1, a choice that was not offered, a choice that is not the most probable option, duplicate or unknown probability keys, or a distribution that does not sum to 1 within 0.02 makes that field invalid. Invalid and refused fields always need human review. Nothing is clamped.
+- Error bodies (Jev 422 includes an `input` preview) can echo email text, so error messages keep only HTTP status and short error codes.
+- 408, 429, 5xx, timeouts, and network failures retry with bounded exponential backoff (default two retries, `Retry-After` honored up to 8 s). Other 4xx errors fail immediately. The AI SDK path uses the SDK's own bounded `maxRetries`.
+- The Vercel AI SDK 7 also ships an experimental `decide` API. This project does not use it for Jev or OpenAI, to keep the request and response contract exactly as each provider documents it.
