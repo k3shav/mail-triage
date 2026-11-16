@@ -56,18 +56,24 @@ export function App() {
   // Async results are applied only if they still belong to what is on screen.
   // These refs change synchronously with user actions, before React re-renders.
   const sessionGeneration = useRef(0);
-  const selection = useRef<{ mailbox: MailboxName; id: number | null }>({ mailbox: 'demo', id: null });
+  const selection = useRef<{ mailbox: MailboxName; id: number | null; token: number }>({ mailbox: 'demo', id: null, token: 0 });
+  // Detail writes are ordered: each read takes a token when it starts and each
+  // mutation result takes one when it lands; only the newest token may write.
+  const detailWrite = useRef(0);
   const listGeneration = useRef(0);
   const loadedCount = useRef(PAGE_SIZE);
 
   const isCurrent = useCallback(
     (origin: DetailOrigin) =>
-      origin.generation === sessionGeneration.current && selection.current.mailbox === origin.mailbox && selection.current.id === origin.id,
+      origin.generation === sessionGeneration.current &&
+      origin.selection === selection.current.token &&
+      selection.current.mailbox === origin.mailbox &&
+      selection.current.id === origin.id,
     [],
   );
 
   const select = useCallback((nextMailbox: MailboxName, id: number | null) => {
-    selection.current = { mailbox: nextMailbox, id };
+    selection.current = { mailbox: nextMailbox, id, token: selection.current.token + 1 };
     setMailbox(nextMailbox);
     setSelectedId(id);
   }, []);
@@ -244,8 +250,9 @@ export function App() {
   const loadDetail = useCallback(
     async (origin: DetailOrigin) => {
       try {
+        const token = ++detailWrite.current;
         const data = await api.message(origin.mailbox, origin.id);
-        if (isCurrent(origin)) setDetail({ origin, data });
+        if (isCurrent(origin) && token === detailWrite.current) setDetail({ origin, data });
       } catch (error) {
         if (!isCurrent(origin)) return;
         handleError(error);
@@ -257,10 +264,10 @@ export function App() {
   );
 
   useEffect(() => {
-    selection.current = { mailbox, id: selectedId };
+    selection.current = { ...selection.current, mailbox, id: selectedId };
     setDetail(null);
     if (selectedId !== null && session.phase === 'ready') {
-      void loadDetail({ mailbox, id: selectedId, generation: sessionGeneration.current });
+      void loadDetail({ mailbox, id: selectedId, generation: sessionGeneration.current, selection: selection.current.token });
     }
   }, [mailbox, selectedId, session.phase, loadDetail]);
 
@@ -282,15 +289,19 @@ export function App() {
    */
   const afterChange = useCallback(
     async (origin?: DetailOrigin, next?: MessageDetail) => {
-      if (origin && next && isCurrent(origin)) setDetail({ origin, data: next });
+      if (origin && next && isCurrent(origin)) {
+        // Newer than any read still in flight for this message.
+        detailWrite.current += 1;
+        setDetail({ origin, data: next });
+      }
       await Promise.all([refreshList(), refreshStatus()]);
     },
     [refreshList, refreshStatus, isCurrent],
   );
 
   const reloadSelected = useCallback(async () => {
-    const { mailbox: m, id } = selection.current;
-    if (id !== null) await loadDetail({ mailbox: m, id, generation: sessionGeneration.current });
+    const { mailbox: m, id, token } = selection.current;
+    if (id !== null) await loadDetail({ mailbox: m, id, generation: sessionGeneration.current, selection: token });
   }, [loadDetail]);
 
   const runSync = async () => {
@@ -437,7 +448,7 @@ export function App() {
                 mailbox={mailbox}
               />
               <MessageDetailView
-                key={`${mailbox}:${selectedId ?? ''}`}
+                key={`${mailbox}:${selectedId ?? ''}:${selection.current.token}`}
                 mailbox={mailbox}
                 origin={visibleDetail?.origin ?? null}
                 detail={visibleDetail?.data ?? null}

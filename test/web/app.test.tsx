@@ -289,3 +289,95 @@ describe('missing messages', () => {
     expect(screen.getByText('Select a message to review its classification.')).toBeTruthy();
   });
 });
+
+describe('repeat visits and same-message ordering', () => {
+  const withBody = (id: number, text: string) => detail(id, { body: { text, source: 'plain', truncated: false } });
+  const classifyStats = { attempted: 0, classified: 0, needsReview: 0, failed: 0, superseded: 0, remaining: 0, stoppedEarly: false };
+
+  it('does not revive a read from an earlier visit after going A → B → A', async () => {
+    setup();
+    await renderApp();
+    const oldA = deferred<MessageDetail>();
+    const newA = deferred<MessageDetail>();
+    let aCalls = 0;
+    mockApi.message.mockImplementation((_m: MailboxName, id: number) =>
+      id === 1 ? (++aCalls === 1 ? oldA.promise : newA.promise) : Promise.resolve(detail(2)),
+    );
+
+    fireEvent.click(row('Subject 1'));
+    fireEvent.click(row('Subject 2'));
+    await waitFor(() => expect(heading()).toBe('Subject 2'));
+    fireEvent.click(row('Subject 1'));
+    await act(async () => newA.resolve(withBody(1, 'CURRENT A')));
+    await screen.findByText('CURRENT A');
+    await act(async () => oldA.resolve(withBody(1, 'STALE A')));
+
+    expect(screen.queryByText('STALE A')).toBeNull();
+    expect(screen.getByText('CURRENT A')).toBeTruthy();
+  });
+
+  it('lets the newest read of the same message win', async () => {
+    setup();
+    mockApi.classify.mockResolvedValue(classifyStats);
+    await renderApp();
+    const first = deferred<MessageDetail>();
+    const second = deferred<MessageDetail>();
+    mockApi.message.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+
+    fireEvent.click(row('Subject 1'));
+    // Classify pending reloads the selected message after the run.
+    fireEvent.click(screen.getByRole('button', { name: 'Classify pending' }));
+    await waitFor(() => expect(mockApi.message).toHaveBeenCalledTimes(2));
+    await act(async () => second.resolve(withBody(1, 'NEWER READ')));
+    await screen.findByText('NEWER READ');
+    await act(async () => first.resolve(withBody(1, 'OLDER READ')));
+
+    expect(screen.queryByText('OLDER READ')).toBeNull();
+    expect(screen.getByText('NEWER READ')).toBeTruthy();
+  });
+
+  it('does not let a read started before a correction overwrite the saved correction', async () => {
+    setup();
+    mockApi.classify.mockResolvedValue(classifyStats);
+    await renderApp();
+    const reload = deferred<MessageDetail>();
+    mockApi.message.mockResolvedValueOnce(detail(1)).mockReturnValueOnce(reload.promise);
+    mockApi.correct.mockResolvedValue(withBody(1, 'SAVED CORRECTION'));
+
+    fireEvent.click(row('Subject 1'));
+    await waitFor(() => expect(heading()).toBe('Subject 1'));
+    fireEvent.click(screen.getByRole('button', { name: 'Classify pending' }));
+    await waitFor(() => expect(mockApi.message).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole('button', { name: /Correct/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Save correction/ }));
+    await screen.findByText('SAVED CORRECTION');
+    await act(async () => reload.resolve(withBody(1, 'PRE-CORRECTION READ')));
+
+    expect(screen.queryByText('PRE-CORRECTION READ')).toBeNull();
+    expect(screen.getByText('SAVED CORRECTION')).toBeTruthy();
+  });
+
+  it('drops a mutation result from the first visit to A after returning to A', async () => {
+    setup();
+    await renderApp();
+    let aCalls = 0;
+    mockApi.message.mockImplementation(async (_m: MailboxName, id: number) =>
+      id === 1 ? withBody(1, ++aCalls === 1 ? 'FIRST VISIT' : 'SECOND VISIT') : detail(2),
+    );
+    const correction = deferred<MessageDetail>();
+    mockApi.correct.mockReturnValue(correction.promise);
+
+    fireEvent.click(row('Subject 1'));
+    await screen.findByText('FIRST VISIT');
+    fireEvent.click(screen.getByRole('button', { name: /Correct/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Save correction/ }));
+    fireEvent.click(row('Subject 2'));
+    await waitFor(() => expect(heading()).toBe('Subject 2'));
+    fireEvent.click(row('Subject 1'));
+    await screen.findByText('SECOND VISIT');
+    await act(async () => correction.resolve(withBody(1, 'FIRST VISIT CORRECTION')));
+
+    expect(screen.queryByText('FIRST VISIT CORRECTION')).toBeNull();
+    expect(screen.getByText('SECOND VISIT')).toBeTruthy();
+  });
+});

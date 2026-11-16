@@ -240,4 +240,9 @@ export interface DetailOrigin {
   id: number;
   /** Session generation; bumps on sign-in, sign-out, and expired sessions. */
   generation: number;
+  /**
+   * Selection token; bumps on every selection, including re-selecting the same
+   * message, so work started during an earlier visit never applies to a later one.
+   */
+  selection: number;
 }

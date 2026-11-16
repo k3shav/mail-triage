@@ -162,6 +162,7 @@ function sameOrigin(a: PreviewOrigin, b: PreviewOrigin) {
     a.mailbox === b.mailbox &&
     a.id === b.id &&
     a.generation === b.generation &&
+    a.selection === b.selection &&
     a.decisionSeq === b.decisionSeq &&
     a.taxonomyRevision === b.taxonomyRevision
   );
@@ -528,7 +529,7 @@ export function MessageDetailView(props: Props) {
         </section>
 
         <LabelPanel
-          key={`${origin.generation}:${origin.mailbox}:${origin.id}:${decision.taxonomyRevision}:${decision.decisionSeq}`}
+          key={`${origin.generation}:${origin.selection}:${origin.mailbox}:${origin.id}:${decision.taxonomyRevision}:${decision.decisionSeq}`}
           mailbox={mailbox}
           origin={origin}
           detail={detail}
