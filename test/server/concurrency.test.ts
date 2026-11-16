@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { openDatabase } from '../../src/server/db/database.js';
 import { Store } from '../../src/server/db/store.js';
 import { LOCK_TTL_MS, LeaseLostError, withLock } from '../../src/server/services/concurrency.js';
-import { Client, ScriptedModel, createHarness } from '../helpers/harness.js';
+import { ScriptedModel, connectedHarness } from '../helpers/harness.js';
 import { plainMessage } from '../helpers/fake-google.js';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -117,30 +117,28 @@ describe('job leases', () => {
       await gate;
       return original(request);
     };
-    const h = createHarness({ model });
+    const h = await connectedHarness({ model });
     h.google.addMessages(plainMessage('m1', 'Deploy failed', 'Build failed.'), plainMessage('m2', 'Receipt', 'Thanks.'));
-    const client = await new Client(h.app).signIn();
-    await client.connectGmail();
-    await client.post('/api/mailboxes/gmail/sync');
     const accountId = h.store.getGmailAccount()!.id;
 
-    const run = client.post('/api/mailboxes/gmail/classify', {}).then((r) => r);
-    for (let i = 0; i < 200 && started < 2; i += 1) await sleep(5);
-    expect(started).toBe(2);
-    // The web process stalls past the lease; a cron run takes the mailbox over.
+    const run = h.context.pipeline.runCycle({ mode: 'apply' });
+    // The first message is sent alone, so a bad key fails once rather than once per worker.
+    for (let i = 0; i < 200 && started < 1; i += 1) await sleep(5);
+    expect(started).toBe(1);
+    // The server process stalls past the lease; a CLI run takes the mailbox over.
     h.clock.now += LOCK_TTL_MS + 1;
-    expect(h.store.acquireLock(`classify:${accountId}`, 'cron', LOCK_TTL_MS)).toBe(true);
+    expect(h.store.acquireLock(`pipeline:${accountId}`, 'cron', LOCK_TTL_MS)).toBe(true);
     release();
 
-    const response = await run;
-    expect(response.status).toBe(409);
-    expect(response.body.error.code).toBe('lease_lost');
-    const ids = h.store.listMessages(accountId, 10).map((m) => m.id);
-    expect(h.store.latestClassifications(ids).size).toBe(0);
-    expect(h.store.lastRun(accountId, 'classify')!.status).toBe('failed');
-    expect(h.store.holdsLock(`classify:${accountId}`, 'cron')).toBe(true);
+    const result = await run;
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Another process took over/);
+    expect(h.store.db.prepare('SELECT COUNT(*) AS n FROM classifications').get()).toEqual({ n: 0 });
+    expect(h.store.lastCycle()!.status).toBe('failed');
+    expect(h.store.holdsLock(`pipeline:${accountId}`, 'cron')).toBe(true);
+    expect(h.google.gmailWrites()).toHaveLength(0);
 
-    h.store.releaseLock(`classify:${accountId}`, 'cron');
-    expect((await client.post('/api/mailboxes/gmail/classify', {})).body).toMatchObject({ classified: 2 });
+    h.store.releaseLock(`pipeline:${accountId}`, 'cron');
+    expect((await h.context.pipeline.runCycle({ mode: 'apply' })).classify).toMatchObject({ classified: 2 });
   });
 });

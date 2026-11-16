@@ -1,7 +1,7 @@
 {
   "name": "mail-triage",
   "version": "0.1.0",
-  "description": "Gmail-first email classifier with configurable categories, separate action and priority decisions, and explicit review before labels change.",
+  "description": "Background Gmail labeler: classifies new mail into your own categories plus separate action and priority, and adds namespaced labels in Gmail.",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -12,11 +12,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "build": "tsc -p tsconfig.build.json",
-    "dev": "tsx watch src/server/main.ts",
-    "start": "node dist/node/server/main.js",
-    "cli": "node dist/node/cli/index.js",
-    "classify": "tsx src/cli/classify-file.ts"
+    "build": "node scripts/build.mjs clean && tsc -p tsconfig.build.json && node scripts/build.mjs assets",
+    "dev": "tsx watch --env-file-if-exists=.env src/server/main.ts",
+    "start": "node --env-file-if-exists=.env dist/node/server/main.js",
+    "cli": "node --env-file-if-exists=.env dist/node/cli/index.js",
+    "classify": "tsx --env-file-if-exists=.env src/cli/classify-file.ts"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "^3.0.92",
@@ -37,5 +37,12 @@
   },
   "bin": {
     "mail-triage": "dist/node/cli/index.js"
-  }
+  },
+  "files": [
+    "dist",
+    "examples",
+    "README.md",
+    "LICENSE",
+    ".env.example"
+  ]
 }

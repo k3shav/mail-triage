@@ -1,23 +1,13 @@
 import { z } from 'zod';
-import {
-  DEFAULT_REVIEW_POLICY,
-  FieldDecisionSchema,
-  ReviewPolicySchema,
-  type ConfidenceKind,
-  type ProviderDecision,
-  type ReviewPolicy,
-} from '../../core/decision.js';
+import { FieldDecisionSchema, type ConfidenceKind, type ProviderDecision } from '../../core/decision.js';
 import { PROMPT_VERSION } from '../../core/prompt.js';
-import { DEFAULT_TAXONOMY, TaxonomySchema, isValidOptionId, taxonomyHash, type Taxonomy } from '../../core/taxonomy.js';
-import { AppError } from '../errors.js';
+import { DEFAULT_TAXONOMY, TaxonomySchema, taxonomyHash, type Taxonomy } from '../../core/taxonomy.js';
+import type { TaggingMode } from '../config.js';
 import type { Db } from './database.js';
-
-export type AccountKind = 'gmail' | 'demo';
-export const DEMO_ACCOUNT_ID = 'demo';
 
 export interface Account {
   id: string;
-  kind: AccountKind;
+  kind: 'gmail';
   email: string;
   grantedScopes: string[];
   refreshTokenEnc: string | null;
@@ -59,6 +49,10 @@ export interface StoredMessage extends NewMessage {
   lastError: string | null;
   fetchedAt: number;
   labelsCheckedAt: number;
+  /** Listed by the most recent sync (the newest SYNC_MAX_MESSAGES inbox messages). */
+  inWindow: boolean;
+  classifyFailures: number;
+  classifyFailedRevision: number | null;
 }
 
 export interface TaxonomyRevision {
@@ -85,58 +79,54 @@ export interface StoredClassification {
   createdAt: number;
 }
 
-export interface StoredCorrection {
-  id: number;
-  accountId: string;
-  messageId: number;
-  seq: number;
-  taxonomyRevision: number;
-  kind: 'accept' | 'edit';
-  category: string;
-  action: string;
-  priority: string;
-  basedOnClassificationId: number | null;
-  createdAt: number;
-}
+export type TagOutcome = 'labeled' | 'review' | 'labeled_review';
+export type TagStatus = 'planned' | 'applied' | 'failed' | 'skipped';
 
-export interface LabelPreviewRow {
-  id: string;
-  accountId: string;
+/** What the tagger last did for one message, and for which plan. */
+export interface TagRow {
   messageId: number;
-  externalId: string;
+  accountId: string;
+  /** Null when the plan comes from a message that could not be classified. */
+  classificationId: number | null;
   taxonomyRevision: number;
-  decisionSeq: number;
-  decisionSource: 'model' | 'human';
-  decisionRef: number;
-  provider: string;
-  model: string;
+  planKey: string;
+  outcome: TagOutcome;
   labels: string[];
-  createdAt: number;
-  expiresAt: number;
-  consumedAt: number | null;
-}
-
-export interface LabelApplyRow {
-  id: number;
-  previewId: string;
-  accountId: string;
-  messageId: number;
-  status: 'pending' | 'applied' | 'noop' | 'failed';
-  addedLabels: string[];
+  status: TagStatus;
+  added: string[];
+  failures: number;
+  nextAttemptAt: number | null;
   error: string | null;
-  createdAt: number;
-  finishedAt: number | null;
+  updatedAt: number;
 }
 
-export interface RunRow {
+export interface TagCandidate {
+  message: StoredMessage;
+  classification: StoredClassification | null;
+}
+
+export type CycleStatus = 'running' | 'ok' | 'partial' | 'failed' | 'aborted' | 'not_ready';
+
+export interface CycleRow {
   id: number;
-  accountId: string;
-  kind: 'sync' | 'classify';
+  accountId: string | null;
+  mode: TaggingMode;
   startedAt: number;
   finishedAt: number | null;
-  status: 'running' | 'ok' | 'partial' | 'failed';
-  stats: Record<string, number>;
+  status: CycleStatus;
+  summary: Record<string, unknown>;
   error: string | null;
+}
+
+/** A message whose classification failed this many times at one revision is marked for review instead. */
+export const MAX_CLASSIFY_FAILURES = 5;
+/** Label writes for one plan are retried this many times, then left alone until the plan changes. */
+export const MAX_TAG_FAILURES = 6;
+const MAX_RETRY_DELAY_MS = 6 * 3600_000;
+
+/** 1, 2, 4, ... minutes, capped at six hours. */
+export function retryDelayMs(failures: number): number {
+  return Math.min(60_000 * 2 ** Math.max(0, failures - 1), MAX_RETRY_DELAY_MS);
 }
 
 const FieldsSchema = z.object({ category: FieldDecisionSchema, action: FieldDecisionSchema, priority: FieldDecisionSchema });
@@ -147,7 +137,7 @@ type Row = Record<string, unknown>;
 function toAccount(row: Row): Account {
   return {
     id: row.id as string,
-    kind: row.kind as AccountKind,
+    kind: 'gmail',
     email: row.email as string,
     grantedScopes: (row.granted_scopes as string).split(' ').filter(Boolean),
     refreshTokenEnc: (row.refresh_token_enc as string | null) ?? null,
@@ -181,6 +171,9 @@ function toMessage(row: Row): StoredMessage {
     lastError: (row.last_error as string | null) ?? null,
     fetchedAt: row.fetched_at as number,
     labelsCheckedAt: row.labels_checked_at as number,
+    inWindow: row.in_window === 1,
+    classifyFailures: row.classify_failures as number,
+    classifyFailedRevision: (row.classify_failed_revision as number | null) ?? null,
   };
 }
 
@@ -203,81 +196,35 @@ function toClassification(row: Row): StoredClassification {
   };
 }
 
-function toCorrection(row: Row): StoredCorrection {
+function toTag(row: Row): TagRow {
   return {
-    id: row.id as number,
-    accountId: row.account_id as string,
     messageId: row.message_id as number,
-    seq: row.seq as number,
-    taxonomyRevision: row.taxonomy_revision as number,
-    kind: row.kind as StoredCorrection['kind'],
-    category: row.category as string,
-    action: row.action as string,
-    priority: row.priority as string,
-    basedOnClassificationId: (row.based_on_classification_id as number | null) ?? null,
-    createdAt: row.created_at as number,
-  };
-}
-
-function toPreview(row: Row): LabelPreviewRow {
-  return {
-    id: row.id as string,
     accountId: row.account_id as string,
-    messageId: row.message_id as number,
-    externalId: row.external_id as string,
+    classificationId: (row.classification_id as number | null) ?? null,
     taxonomyRevision: row.taxonomy_revision as number,
-    decisionSeq: row.decision_seq as number,
-    decisionSource: row.decision_source as LabelPreviewRow['decisionSource'],
-    decisionRef: row.decision_ref as number,
-    provider: row.provider as string,
-    model: row.model as string,
+    planKey: row.plan_key as string,
+    outcome: row.outcome as TagOutcome,
     labels: json<string[]>(row.labels as string),
-    createdAt: row.created_at as number,
-    expiresAt: row.expires_at as number,
-    consumedAt: (row.consumed_at as number | null) ?? null,
-  };
-}
-
-function toApply(row: Row): LabelApplyRow {
-  return {
-    id: row.id as number,
-    previewId: row.preview_id as string,
-    accountId: row.account_id as string,
-    messageId: row.message_id as number,
-    status: row.status as LabelApplyRow['status'],
-    addedLabels: json<string[]>(row.added_labels as string),
+    status: row.status as TagStatus,
+    added: json<string[]>(row.added as string),
+    failures: row.failures as number,
+    nextAttemptAt: (row.next_attempt_at as number | null) ?? null,
     error: (row.error as string | null) ?? null,
-    createdAt: row.created_at as number,
-    finishedAt: (row.finished_at as number | null) ?? null,
+    updatedAt: row.updated_at as number,
   };
 }
 
-function toRun(row: Row): RunRow {
+function toCycle(row: Row): CycleRow {
   return {
     id: row.id as number,
-    accountId: row.account_id as string,
-    kind: row.kind as RunRow['kind'],
+    accountId: (row.account_id as string | null) ?? null,
+    mode: row.mode as TaggingMode,
     startedAt: row.started_at as number,
     finishedAt: (row.finished_at as number | null) ?? null,
-    status: row.status as RunRow['status'],
-    stats: json<Record<string, number>>(row.stats as string),
+    status: row.status as CycleStatus,
+    summary: json<Record<string, unknown>>(row.summary as string),
     error: (row.error as string | null) ?? null,
   };
-}
-
-export interface CorrectionInput {
-  accountId: string;
-  messageId: number;
-  kind: StoredCorrection['kind'];
-  /** Configuration revision the reviewer saw. */
-  expectedTaxonomyRevision: number;
-  /** Message decision sequence the reviewer saw. */
-  expectedDecisionSeq: number;
-  /** Required for `edit`. Optional for `accept`: if given, must equal the classification's values. */
-  category?: string;
-  action?: string;
-  priority?: string;
-  basedOnClassificationId: number | null;
 }
 
 export class StaleRevisionError extends Error {
@@ -286,6 +233,18 @@ export class StaleRevisionError extends Error {
     super(`Configuration changed (now revision ${current}); reload and try again`);
   }
 }
+
+/**
+ * A tag row is "done" for this plan when it was applied, skipped, is waiting
+ * for its retry time, or gave up. In dry-run mode a recorded plan also counts,
+ * so unchanged cycles stay quiet; apply mode picks dry-run plans up.
+ */
+const TAG_DONE = `t.taxonomy_revision = @revision AND t.plan_key = @planKey AND (
+  t.status IN ('applied', 'skipped')
+  OR (@dryRun = 1 AND t.status = 'planned')
+  OR (t.status = 'failed' AND (t.next_attempt_at IS NULL OR t.next_attempt_at > @now)))`;
+
+const LATEST_AT_REVISION = `SELECT id FROM classifications WHERE message_id = m.id AND taxonomy_revision = @revision ORDER BY seq DESC LIMIT 1`;
 
 /** All SQL lives here. better-sqlite3 is synchronous, so each method is atomic within the process. */
 export class Store {
@@ -299,23 +258,13 @@ export class Store {
   // ---- accounts -----------------------------------------------------------
 
   getAccount(id: string): Account | null {
-    const row = this.db.prepare('SELECT * FROM accounts WHERE id = ?').get(id) as Row | undefined;
+    const row = this.db.prepare("SELECT * FROM accounts WHERE id = ? AND kind = 'gmail'").get(id) as Row | undefined;
     return row ? toAccount(row) : null;
   }
 
   getGmailAccount(): Account | null {
     const row = this.db.prepare("SELECT * FROM accounts WHERE kind = 'gmail'").get() as Row | undefined;
     return row ? toAccount(row) : null;
-  }
-
-  ensureDemoAccount(): Account {
-    const now = this.now();
-    this.db
-      .prepare(
-        "INSERT INTO accounts (id, kind, email, created_at, updated_at) VALUES (?, 'demo', 'sam@example.com', ?, ?) ON CONFLICT(id) DO NOTHING",
-      )
-      .run(DEMO_ACCOUNT_ID, now, now);
-    return this.getAccount(DEMO_ACCOUNT_ID)!;
   }
 
   insertGmailAccount(account: { id: string; email: string; grantedScopes: string[]; refreshTokenEnc: string; keyFingerprint: string }): Account {
@@ -350,6 +299,7 @@ export class Store {
   deleteAccount(id: string): void {
     this.db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
     this.db.prepare('DELETE FROM runs WHERE account_id = ?').run(id);
+    this.db.prepare('DELETE FROM cycles WHERE account_id = ?').run(id);
   }
 
   // ---- messages -----------------------------------------------------------
@@ -359,9 +309,9 @@ export class Store {
     const result = this.db
       .prepare(
         `INSERT INTO messages (account_id, external_id, thread_id, from_addr, to_addr, cc_addr, subject, sent_at, internal_date,
-           snippet, body_text, body_source, body_truncated, signals, label_ids, unread, fetched_at, labels_checked_at)
+           snippet, body_text, body_source, body_truncated, signals, label_ids, unread, fetched_at, labels_checked_at, in_window)
          VALUES (@accountId, @externalId, @threadId, @from, @to, @cc, @subject, @sentAt, @internalDate,
-           @snippet, @bodyText, @bodySource, @bodyTruncated, @signals, @labelIds, @unread, @now, @now)
+           @snippet, @bodyText, @bodySource, @bodyTruncated, @signals, @labelIds, @unread, @now, @now, 1)
          ON CONFLICT(account_id, external_id) DO NOTHING`,
       )
       .run({
@@ -384,6 +334,21 @@ export class Store {
     return new Set(rows.map((row) => row.external_id as string));
   }
 
+  /**
+   * Record which stored messages the latest sync listed. Only those are
+   * classified, so a configuration change reclassifies the current inbox
+   * window rather than every message ever stored.
+   */
+  markWindow(accountId: string, externalIds: string[]): void {
+    this.db
+      .transaction(() => {
+        this.db.prepare('UPDATE messages SET in_window = 0 WHERE account_id = ? AND in_window = 1').run(accountId);
+        const mark = this.db.prepare('UPDATE messages SET in_window = 1 WHERE account_id = ? AND external_id = ?');
+        for (const id of externalIds) mark.run(accountId, id);
+      })
+      .immediate();
+  }
+
   updateMessageLabels(accountId: string, externalId: string, labelIds: string[]): void {
     this.db
       .prepare('UPDATE messages SET label_ids = ?, unread = ?, labels_checked_at = ? WHERE account_id = ? AND external_id = ?')
@@ -399,38 +364,58 @@ export class Store {
     return (this.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE account_id = ?').get(accountId) as Row).n as number;
   }
 
-  /** Newest first, bounded. */
-  listMessages(accountId: string, limit: number): StoredMessage[] {
+  private pendingClassificationWhere = `m.account_id = @accountId AND m.in_window = 1
+    AND NOT EXISTS (SELECT 1 FROM classifications c WHERE c.message_id = m.id AND c.taxonomy_revision = @revision)
+    AND (m.classify_failed_revision IS NOT @revision
+         OR (m.classify_failures < @maxFailures AND (m.next_classify_at IS NULL OR m.next_classify_at <= @now)))`;
+
+  /**
+   * Messages in the sync window with no classification at `revision` whose
+   * retry time (after earlier failures) has come. Newest first.
+   */
+  messagesNeedingClassification(accountId: string, revision: number, limit: number): StoredMessage[] {
     const rows = this.db
-      .prepare('SELECT * FROM messages WHERE account_id = ? ORDER BY internal_date DESC, id DESC LIMIT ?')
-      .all(accountId, limit) as Row[];
+      .prepare(`SELECT m.* FROM messages m WHERE ${this.pendingClassificationWhere} ORDER BY m.internal_date DESC, m.id DESC LIMIT @limit`)
+      .all({ accountId, revision, maxFailures: MAX_CLASSIFY_FAILURES, now: this.now(), limit }) as Row[];
     return rows.map(toMessage);
   }
 
-  /** Messages with neither a classification nor a correction at `revision`. */
-  messagesNeedingClassification(accountId: string, revision: number, limit: number, includeErrored: boolean): StoredMessage[] {
-    const rows = this.db
-      .prepare(
-        `SELECT m.* FROM messages m
-         WHERE m.account_id = ?
-           AND NOT EXISTS (SELECT 1 FROM classifications c WHERE c.message_id = m.id AND c.taxonomy_revision = ?)
-           AND NOT EXISTS (SELECT 1 FROM corrections k WHERE k.message_id = m.id AND k.taxonomy_revision = ?)
-           AND (? OR m.last_error IS NULL)
-         ORDER BY m.internal_date DESC, m.id DESC LIMIT ?`,
-      )
-      .all(accountId, revision, revision, includeErrored ? 1 : 0, limit) as Row[];
-    return rows.map(toMessage);
+  countNeedingClassification(accountId: string, revision: number): number {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM messages m WHERE ${this.pendingClassificationWhere}`)
+      .get({ accountId, revision, maxFailures: MAX_CLASSIFY_FAILURES, now: this.now() }) as Row;
+    return row.n as number;
   }
 
-  setMessageError(messageId: number, error: string | null): void {
-    this.db.prepare('UPDATE messages SET last_error = ? WHERE id = ?').run(error, messageId);
+  /**
+   * Count one failed classification of this message at `revision` and
+   * schedule the retry. Returns the failure count; at MAX_CLASSIFY_FAILURES
+   * the message is no longer retried at this revision.
+   */
+  recordClassifyFailure(messageId: number, revision: number, error: string): number {
+    return this.db
+      .transaction(() => {
+        const row = this.db.prepare('SELECT classify_failures, classify_failed_revision FROM messages WHERE id = ?').get(messageId) as Row | undefined;
+        if (!row) return 0;
+        const failures = row.classify_failed_revision === revision ? (row.classify_failures as number) + 1 : 1;
+        const next = failures >= MAX_CLASSIFY_FAILURES ? null : this.now() + retryDelayMs(failures);
+        this.db
+          .prepare('UPDATE messages SET last_error = ?, classify_failures = ?, classify_failed_revision = ?, next_classify_at = ? WHERE id = ?')
+          .run(error, failures, revision, next, messageId);
+        return failures;
+      })
+      .immediate();
   }
 
-  // ---- taxonomy and settings ---------------------------------------------
+  // ---- taxonomy -----------------------------------------------------------
 
   private ensureTaxonomy(): void {
-    const existing = this.db.prepare('SELECT COUNT(*) AS n FROM taxonomy_revisions').get() as Row;
-    if ((existing.n as number) === 0) this.insertTaxonomy(DEFAULT_TAXONOMY);
+    this.db
+      .transaction(() => {
+        const existing = this.db.prepare('SELECT COUNT(*) AS n FROM taxonomy_revisions').get() as Row;
+        if ((existing.n as number) === 0) this.insertTaxonomy(DEFAULT_TAXONOMY);
+      })
+      .immediate();
   }
 
   private insertTaxonomy(taxonomy: Taxonomy): TaxonomyRevision {
@@ -464,27 +449,25 @@ export class Store {
       .immediate();
   }
 
-  getReviewPolicy(): ReviewPolicy {
-    const row = this.db.prepare("SELECT value FROM settings WHERE key = 'review_policy'").get() as Row | undefined;
-    if (!row) return DEFAULT_REVIEW_POLICY;
-    const parsed = ReviewPolicySchema.safeParse(JSON.parse(row.value as string));
-    return parsed.success ? parsed.data : DEFAULT_REVIEW_POLICY;
+  /** Make `taxonomy` current, creating a revision only when its content differs. */
+  replaceTaxonomy(taxonomy: Taxonomy): { revision: TaxonomyRevision; changed: boolean } {
+    return this.db
+      .transaction(() => {
+        const current = this.currentTaxonomy();
+        if (taxonomyHash(taxonomy, PROMPT_VERSION) === current.hash) return { revision: current, changed: false };
+        return { revision: this.insertTaxonomy(taxonomy), changed: true };
+      })
+      .immediate();
   }
 
-  setReviewPolicy(policy: ReviewPolicy): void {
-    this.db
-      .prepare("INSERT INTO settings (key, value) VALUES ('review_policy', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-      .run(JSON.stringify(policy));
-  }
-
-  // ---- decisions ----------------------------------------------------------
+  // ---- classifications ----------------------------------------------------
 
   /**
    * Store a model result only if nothing changed while the model ran: the
    * message's decision sequence and the configuration revision must still be
    * the ones read before inference. Otherwise the result is discarded and
-   * `null` is returned, so a late answer never replaces a newer human
-   * correction or lands on a configuration it was not asked about.
+   * `null` is returned, so a late answer never lands on a configuration it
+   * was not asked about.
    */
   insertClassification(input: {
     accountId: string;
@@ -524,104 +507,10 @@ export class Store {
             input.decision.usage ? JSON.stringify(input.decision.usage) : null,
             this.now(),
           );
-        this.db.prepare('UPDATE messages SET last_error = NULL WHERE id = ?').run(input.messageId);
+        this.db
+          .prepare('UPDATE messages SET last_error = NULL, classify_failures = 0, classify_failed_revision = NULL, next_classify_at = NULL WHERE id = ?')
+          .run(input.messageId);
         return this.getClassification(Number(result.lastInsertRowid))!;
-      })
-      .immediate();
-  }
-
-  /**
-   * Record a human decision against exactly what the reviewer saw. In one
-   * transaction: the configuration revision and the message's decision
-   * sequence must match the caller's expectations, a referenced
-   * classification must belong to this message at the current revision, and
-   * an `accept` must name the current model decision and takes its values
-   * from it. Conflicts throw a 409 AppError.
-   */
-  insertCorrection(input: CorrectionInput): StoredCorrection {
-    return this.db
-      .transaction(() => {
-        const { revision, taxonomy } = this.currentTaxonomy();
-        if (revision !== input.expectedTaxonomyRevision) throw new StaleRevisionError(revision);
-        const message = this.getMessage(input.accountId, input.messageId);
-        if (!message) throw new AppError(404, 'not_found', 'Message not found');
-        if (message.decisionSeq !== input.expectedDecisionSeq) {
-          throw new AppError(409, 'stale_decision', 'The classification or correction changed since you reviewed it. Reload and try again.', {
-            currentDecisionSeq: message.decisionSeq,
-          });
-        }
-
-        let basis: StoredClassification | null = null;
-        if (input.basedOnClassificationId !== null) {
-          basis = this.getClassification(input.basedOnClassificationId);
-          if (!basis || basis.accountId !== input.accountId || basis.messageId !== input.messageId) {
-            throw new AppError(409, 'classification_mismatch', 'That classification does not belong to this message');
-          }
-          if (basis.taxonomyRevision !== revision) {
-            throw new AppError(409, 'classification_mismatch', 'That classification was made for an earlier configuration revision');
-          }
-        }
-
-        let values: { category: string; action: string; priority: string };
-        if (input.kind === 'accept') {
-          // The decision sequence is bumped by every classification and
-          // correction, so only the newest record can carry the current seq.
-          const reviewed = basis;
-          if (!reviewed || reviewed.seq !== message.decisionSeq) {
-            throw new AppError(409, 'not_acceptable', 'Only the current model classification can be accepted. Edit the values instead.');
-          }
-          const answered = (field: 'category' | 'action' | 'priority') => {
-            const result = reviewed.fields[field];
-            return result.status === 'answered' && isValidOptionId(taxonomy, field, result.value) ? result.value : null;
-          };
-          const category = answered('category');
-          const action = answered('action');
-          const priority = answered('priority');
-          if (category === null || action === null || priority === null) {
-            throw new AppError(409, 'not_acceptable', 'This classification has missing or invalid answers. Edit the values instead.');
-          }
-          values = { category, action, priority };
-          for (const field of ['category', 'action', 'priority'] as const) {
-            const claimed = input[field];
-            if (claimed !== undefined && claimed !== values[field]) {
-              throw new AppError(409, 'accept_mismatch', 'The accepted values differ from the classification. Reload and try again.', {
-                field,
-                expected: values[field],
-              });
-            }
-          }
-        } else {
-          if (input.category === undefined || input.action === undefined || input.priority === undefined) {
-            throw new AppError(400, 'invalid_request', 'An edit needs category, action, and priority');
-          }
-          values = { category: input.category, action: input.action, priority: input.priority };
-          for (const field of ['category', 'action', 'priority'] as const) {
-            if (!isValidOptionId(taxonomy, field, values[field])) {
-              throw new AppError(400, `unknown_${field}`, `That ${field} does not exist in the current configuration`);
-            }
-          }
-        }
-
-        const seq = this.bumpDecisionSeq(input.messageId);
-        const result = this.db
-          .prepare(
-            `INSERT INTO corrections (account_id, message_id, seq, taxonomy_revision, kind, category, action, priority, based_on_classification_id, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .run(
-            input.accountId,
-            input.messageId,
-            seq,
-            revision,
-            input.kind,
-            values.category,
-            values.action,
-            values.priority,
-            input.basedOnClassificationId,
-            this.now(),
-          );
-        const row = this.db.prepare('SELECT * FROM corrections WHERE id = ?').get(Number(result.lastInsertRowid)) as Row;
-        return toCorrection(row);
       })
       .immediate();
   }
@@ -639,118 +528,113 @@ export class Store {
     return row ? toClassification(row) : null;
   }
 
-  latestClassifications(messageIds: number[]): Map<number, StoredClassification> {
-    return this.latestBy('classifications', messageIds, toClassification);
+  /** Id of the newest classification of a message at `revision`, or null. */
+  latestClassificationId(messageId: number, revision: number): number | null {
+    const row = this.db
+      .prepare('SELECT id FROM classifications WHERE message_id = ? AND taxonomy_revision = ? ORDER BY seq DESC LIMIT 1')
+      .get(messageId, revision) as Row | undefined;
+    return row ? (row.id as number) : null;
   }
 
-  latestCorrections(messageIds: number[]): Map<number, StoredCorrection> {
-    return this.latestBy('corrections', messageIds, toCorrection);
-  }
+  // ---- tags ---------------------------------------------------------------
 
-  private latestBy<T>(table: 'classifications' | 'corrections', messageIds: number[], map: (row: Row) => T): Map<number, T> {
-    const result = new Map<number, T>();
-    for (let i = 0; i < messageIds.length; i += 500) {
-      const chunk = messageIds.slice(i, i + 500);
-      const placeholders = chunk.map(() => '?').join(',');
-      const rows = this.db
-        .prepare(
-          `SELECT t.* FROM ${table} t
-           JOIN (SELECT message_id, MAX(seq) AS seq FROM ${table} WHERE message_id IN (${placeholders}) GROUP BY message_id) latest
-             ON latest.message_id = t.message_id AND latest.seq = t.seq`,
-        )
-        .all(...chunk) as Row[];
-      for (const row of rows) result.set(row.message_id as number, map(row));
-    }
-    return result;
-  }
-
-  history(messageId: number): { classifications: StoredClassification[]; corrections: StoredCorrection[] } {
-    const classifications = (this.db.prepare('SELECT * FROM classifications WHERE message_id = ? ORDER BY seq DESC LIMIT 20').all(messageId) as Row[]).map(toClassification);
-    const corrections = (this.db.prepare('SELECT * FROM corrections WHERE message_id = ? ORDER BY seq DESC LIMIT 20').all(messageId) as Row[]).map(toCorrection);
-    return { classifications, corrections };
-  }
-
-  // ---- label previews and applies ----------------------------------------
-
-  insertPreview(preview: Omit<LabelPreviewRow, 'consumedAt'>): void {
-    this.db
+  /**
+   * Messages whose current plan has not been carried out (or, in dry-run,
+   * recorded) yet: first those with a classification at `revision`, then
+   * those that could not be classified at all. Newest first, bounded.
+   */
+  tagCandidates(accountId: string, revision: number, planKey: string, mode: TaggingMode, limit: number): TagCandidate[] {
+    const params = { accountId, revision, planKey, dryRun: mode === 'dry-run' ? 1 : 0, now: this.now(), limit };
+    const classified = this.db
       .prepare(
-        `INSERT INTO label_previews (id, account_id, message_id, external_id, taxonomy_revision, decision_seq, decision_source, decision_ref,
-           provider, model, labels, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `SELECT m.*, (${LATEST_AT_REVISION}) AS cid FROM messages m
+         WHERE m.account_id = @accountId AND (${LATEST_AT_REVISION}) IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM message_tags t WHERE t.message_id = m.id AND t.classification_id = (${LATEST_AT_REVISION}) AND ${TAG_DONE})
+         ORDER BY m.internal_date DESC, m.id DESC LIMIT @limit`,
       )
-      .run(
-        preview.id,
-        preview.accountId,
-        preview.messageId,
-        preview.externalId,
-        preview.taxonomyRevision,
-        preview.decisionSeq,
-        preview.decisionSource,
-        preview.decisionRef,
-        preview.provider,
-        preview.model,
-        JSON.stringify(preview.labels),
-        preview.createdAt,
-        preview.expiresAt,
-      );
-    this.db.prepare('DELETE FROM label_previews WHERE expires_at < ? AND consumed_at IS NULL').run(this.now() - 86_400_000);
+      .all(params) as Row[];
+    const candidates: TagCandidate[] = classified.map((row) => ({ message: toMessage(row), classification: this.getClassification(row.cid as number) }));
+    if (candidates.length >= limit) return candidates;
+    const unclassifiable = this.db
+      .prepare(
+        `SELECT m.* FROM messages m
+         WHERE m.account_id = @accountId AND m.classify_failed_revision = @revision AND m.classify_failures >= @maxFailures
+           AND NOT EXISTS (SELECT 1 FROM classifications c WHERE c.message_id = m.id AND c.taxonomy_revision = @revision)
+           AND NOT EXISTS (SELECT 1 FROM message_tags t WHERE t.message_id = m.id AND t.classification_id IS NULL AND ${TAG_DONE})
+         ORDER BY m.internal_date DESC, m.id DESC LIMIT @limit`,
+      )
+      .all({ ...params, maxFailures: MAX_CLASSIFY_FAILURES, limit: limit - candidates.length }) as Row[];
+    return [...candidates, ...unclassifiable.map((row) => ({ message: toMessage(row), classification: null }))];
   }
 
-  getPreview(id: string): LabelPreviewRow | null {
-    const row = this.db.prepare('SELECT * FROM label_previews WHERE id = ?').get(id) as Row | undefined;
-    return row ? toPreview(row) : null;
+  getTag(messageId: number): TagRow | null {
+    const row = this.db.prepare('SELECT * FROM message_tags WHERE message_id = ?').get(messageId) as Row | undefined;
+    return row ? toTag(row) : null;
   }
 
   /**
-   * Atomically consume a preview and create its pending apply row. Returns
-   * false if another request already consumed it.
+   * Record the tagger's result for one message. A failure of the same plan
+   * counts toward MAX_TAG_FAILURES and schedules a retry; a new plan starts
+   * the count again.
    */
-  claimPreview(previewId: string): boolean {
-    return this.db
-      .transaction(() => {
-        const now = this.now();
-        const claimed = this.db
-          .prepare('UPDATE label_previews SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL AND expires_at >= ?')
-          .run(now, previewId, now);
-        if (claimed.changes !== 1) return false;
-        const preview = this.getPreview(previewId)!;
-        this.db
-          .prepare("INSERT INTO label_applies (preview_id, account_id, message_id, status, created_at) VALUES (?, ?, ?, 'pending', ?)")
-          .run(previewId, preview.accountId, preview.messageId, now);
-        return true;
-      })
-      .immediate();
-  }
-
-  finishApply(previewId: string, status: 'applied' | 'noop' | 'failed', addedLabels: string[], error: string | null): void {
+  recordTag(input: {
+    accountId: string;
+    messageId: number;
+    classificationId: number | null;
+    taxonomyRevision: number;
+    planKey: string;
+    outcome: TagOutcome;
+    labels: string[];
+    status: TagStatus;
+    added: string[];
+    error: string | null;
+  }): TagRow {
+    const now = this.now();
+    const previous = this.getTag(input.messageId);
+    const samePlan =
+      previous !== null &&
+      previous.classificationId === input.classificationId &&
+      previous.taxonomyRevision === input.taxonomyRevision &&
+      previous.planKey === input.planKey;
+    const failures = input.status === 'failed' ? (samePlan && previous.status === 'failed' ? previous.failures + 1 : 1) : 0;
+    const nextAttemptAt = input.status === 'failed' && failures < MAX_TAG_FAILURES ? now + retryDelayMs(failures) : null;
     this.db
-      .prepare('UPDATE label_applies SET status = ?, added_labels = ?, error = ?, finished_at = ? WHERE preview_id = ?')
-      .run(status, JSON.stringify(addedLabels), error, this.now(), previewId);
+      .prepare(
+        `INSERT INTO message_tags (message_id, account_id, classification_id, taxonomy_revision, plan_key, outcome, labels, status, added,
+           failures, next_attempt_at, error, updated_at)
+         VALUES (@messageId, @accountId, @classificationId, @taxonomyRevision, @planKey, @outcome, @labels, @status, @added,
+           @failures, @nextAttemptAt, @error, @now)
+         ON CONFLICT(message_id) DO UPDATE SET account_id = excluded.account_id, classification_id = excluded.classification_id,
+           taxonomy_revision = excluded.taxonomy_revision, plan_key = excluded.plan_key, outcome = excluded.outcome,
+           labels = excluded.labels, status = excluded.status, added = excluded.added, failures = excluded.failures,
+           next_attempt_at = excluded.next_attempt_at, error = excluded.error, updated_at = excluded.updated_at`,
+      )
+      .run({
+        ...input,
+        labels: JSON.stringify(input.labels),
+        added: JSON.stringify(input.added),
+        failures,
+        nextAttemptAt,
+        now,
+      });
+    return this.getTag(input.messageId)!;
   }
 
-  getApply(previewId: string): LabelApplyRow | null {
-    const row = this.db.prepare('SELECT * FROM label_applies WHERE preview_id = ?').get(previewId) as Row | undefined;
-    return row ? toApply(row) : null;
-  }
-
-  lastApplies(messageId: number, limit = 5): LabelApplyRow[] {
-    return (this.db.prepare('SELECT * FROM label_applies WHERE message_id = ? ORDER BY id DESC LIMIT ?').all(messageId, limit) as Row[]).map(toApply);
-  }
-
-  replaceLabelCache(accountId: string, labels: Array<{ id: string; name: string }>): void {
-    this.db
-      .transaction(() => {
-        this.db.prepare('DELETE FROM gmail_labels WHERE account_id = ?').run(accountId);
-        const insert = this.db.prepare('INSERT OR REPLACE INTO gmail_labels (account_id, label_id, name) VALUES (?, ?, ?)');
-        for (const label of labels) insert.run(accountId, label.id, label.name);
-      })
-      .immediate();
-  }
-
-  labelCache(accountId: string): Map<string, string> {
-    const rows = this.db.prepare('SELECT label_id, name FROM gmail_labels WHERE account_id = ?').all(accountId) as Row[];
-    return new Map(rows.map((row) => [row.label_id as string, row.name as string]));
+  /** Counts of tag rows for the current revision, by status and outcome. Numbers only. */
+  tagCounts(accountId: string, revision: number): Record<string, number> {
+    const rows = this.db
+      .prepare('SELECT status, outcome, COUNT(*) AS n FROM message_tags WHERE account_id = ? AND taxonomy_revision = ? GROUP BY status, outcome')
+      .all(accountId, revision) as Row[];
+    const counts: Record<string, number> = {};
+    for (const row of rows) {
+      const n = row.n as number;
+      counts[row.status as string] = (counts[row.status as string] ?? 0) + n;
+      if (row.status === 'applied' || row.status === 'planned') {
+        const key = `${row.status}_${row.outcome as string}`;
+        counts[key] = (counts[key] ?? 0) + n;
+      }
+    }
+    return counts;
   }
 
   // ---- sessions and OAuth state ------------------------------------------
@@ -793,7 +677,7 @@ export class Store {
       .immediate();
   }
 
-  // ---- locks and runs -----------------------------------------------------
+  // ---- locks and cycles ---------------------------------------------------
 
   /** Cross-process lease. Returns true when acquired. */
   acquireLock(name: string, owner: string, ttlMs: number): boolean {
@@ -824,19 +708,23 @@ export class Store {
     this.db.prepare('DELETE FROM locks WHERE name = ? AND owner = ?').run(name, owner);
   }
 
-  startRun(accountId: string, kind: RunRow['kind']): number {
+  startCycle(accountId: string | null, mode: TaggingMode): number {
     const result = this.db
-      .prepare("INSERT INTO runs (account_id, kind, started_at, status) VALUES (?, ?, ?, 'running')")
-      .run(accountId, kind, this.now());
-    return Number(result.lastInsertRowid);
+      .prepare("INSERT INTO cycles (account_id, mode, started_at, status) VALUES (?, ?, ?, 'running')")
+      .run(accountId, mode, this.now());
+    const id = Number(result.lastInsertRowid);
+    this.db.prepare('DELETE FROM cycles WHERE id <= ?').run(id - 500);
+    return id;
   }
 
-  finishRun(id: number, status: RunRow['status'], stats: Record<string, number>, error: string | null): void {
-    this.db.prepare('UPDATE runs SET finished_at = ?, status = ?, stats = ?, error = ? WHERE id = ?').run(this.now(), status, JSON.stringify(stats), error, id);
+  finishCycle(id: number, status: Exclude<CycleStatus, 'running'>, summary: Record<string, unknown>, error: string | null): void {
+    this.db
+      .prepare('UPDATE cycles SET finished_at = ?, status = ?, summary = ?, error = ? WHERE id = ?')
+      .run(this.now(), status, JSON.stringify(summary), error, id);
   }
 
-  lastRun(accountId: string, kind: RunRow['kind']): RunRow | null {
-    const row = this.db.prepare('SELECT * FROM runs WHERE account_id = ? AND kind = ? ORDER BY id DESC LIMIT 1').get(accountId, kind) as Row | undefined;
-    return row ? toRun(row) : null;
+  lastCycle(): CycleRow | null {
+    const row = this.db.prepare('SELECT * FROM cycles ORDER BY id DESC LIMIT 1').get() as Row | undefined;
+    return row ? toCycle(row) : null;
   }
 }

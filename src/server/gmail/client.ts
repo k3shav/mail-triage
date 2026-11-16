@@ -28,6 +28,22 @@ export class GmailApiError extends Error {
   }
 }
 
+/** A write guard found that the plan behind a write is no longer current. Nothing was sent, and it is never retried. */
+export class WriteSupersededError extends Error {
+  override name = 'WriteSupersededError';
+  constructor(message = 'The planned label change is no longer current; nothing was sent') {
+    super(message);
+  }
+}
+
+/**
+ * Synchronous check that every write attempt passes immediately before it
+ * is dispatched: after the access token is obtained (which may refresh it)
+ * and again before each retry. It throws to stop the write, normally with
+ * WriteSupersededError. Each write call gets its own guard.
+ */
+export type WriteGuard = () => void;
+
 export interface AccessTokenSource {
   /** Return a valid access token, refreshing if needed. */
   get(): Promise<string>;
@@ -73,6 +89,8 @@ export interface GmailClientOptions {
   sleep?: (ms: number) => Promise<void>;
   maxRetries?: number;
   timeoutMs?: number;
+  /** Aborts in-flight requests and prevents new ones (shutdown, lost lease). */
+  signal?: AbortSignal;
 }
 
 /**
@@ -120,6 +138,13 @@ export class GmailClient {
     return message;
   }
 
+  /** Headers only; used when a full message is too large to read. */
+  async getMessageMetadata(id: string): Promise<GmailFullMessage> {
+    const message = FullMessageSchema.parse(await this.request('GET', `/messages/${this.id(id)}?format=metadata`));
+    this.assertSameId(id, message.id);
+    return message;
+  }
+
   async getMessageMinimal(id: string): Promise<GmailMinimalMessage> {
     const message = MinimalMessageSchema.parse(await this.request('GET', `/messages/${this.id(id)}?format=minimal`));
     this.assertSameId(id, message.id);
@@ -131,16 +156,18 @@ export class GmailClient {
     return body.labels;
   }
 
-  async createLabel(name: string): Promise<GmailLabel> {
+  async createLabel(name: string, guard: WriteGuard): Promise<GmailLabel> {
     return LabelSchema.parse(
-      await this.request('POST', '/labels', { name, labelListVisibility: 'labelShow', messageListVisibility: 'show' }),
+      await this.request('POST', '/labels', { name, labelListVisibility: 'labelShow', messageListVisibility: 'show' }, MAX_RESPONSE_BYTES, guard),
     );
   }
 
   /** Additive only: this method cannot send removeLabelIds. */
-  async addLabels(id: string, labelIds: string[]): Promise<GmailMinimalMessage> {
+  async addLabels(id: string, labelIds: string[], guard: WriteGuard): Promise<GmailMinimalMessage> {
     if (labelIds.length === 0) throw new Error('addLabels requires at least one label');
-    const message = MinimalMessageSchema.parse(await this.request('POST', `/messages/${this.id(id)}/modify`, { addLabelIds: labelIds }));
+    const message = MinimalMessageSchema.parse(
+      await this.request('POST', `/messages/${this.id(id)}/modify`, { addLabelIds: labelIds }, MAX_RESPONSE_BYTES, guard),
+    );
     this.assertSameId(id, message.id);
     return message;
   }
@@ -154,12 +181,19 @@ export class GmailClient {
     if (requested !== returned) throw new GmailApiError(502, 'id_mismatch', 'Gmail returned a different message than requested');
   }
 
-  private async request(method: 'GET' | 'POST', path: string, body?: unknown, maxBytes = MAX_RESPONSE_BYTES): Promise<unknown> {
+  private async request(method: 'GET' | 'POST', path: string, body?: unknown, maxBytes = MAX_RESPONSE_BYTES, guard?: WriteGuard): Promise<unknown> {
+    if (method !== 'GET' && !guard) throw new Error('Gmail writes require a write guard');
     let refreshed = false;
+    const external = this.options.signal;
     for (let attempt = 0; ; attempt += 1) {
+      if (external?.aborted) throw new GmailApiError(0, 'aborted', 'Gmail request cancelled');
       const token = await this.options.tokens.get();
+      if (external?.aborted) throw new GmailApiError(0, 'aborted', 'Gmail request cancelled');
+      // Outside the fetch try/catch, and nothing is awaited between this check and dispatch.
+      guard?.();
       let response: Response;
       try {
+        const timeout = AbortSignal.timeout(this.timeoutMs);
         response = await this.fetchImpl(`${GMAIL_API}${path}`, {
           method,
           headers: {
@@ -168,10 +202,11 @@ export class GmailClient {
             ...(body === undefined ? {} : { 'content-type': 'application/json' }),
           },
           body: body === undefined ? undefined : JSON.stringify(body),
-          signal: AbortSignal.timeout(this.timeoutMs),
+          signal: external ? AbortSignal.any([timeout, external]) : timeout,
           redirect: 'error',
         });
       } catch {
+        if (external?.aborted) throw new GmailApiError(0, 'aborted', 'Gmail request cancelled');
         if (attempt < this.maxRetries) {
           await this.sleep(500 * 2 ** attempt);
           continue;
@@ -186,6 +221,7 @@ export class GmailClient {
           if (error instanceof BodyTooLargeError) {
             throw new GmailApiError(502, 'too_large', `Gmail response is larger than ${Math.round(maxBytes / 1024)} KiB; skipped`);
           }
+          if (external?.aborted) throw new GmailApiError(0, 'aborted', 'Gmail request cancelled');
           throw new GmailApiError(0, 'network', 'Gmail response was interrupted');
         }
         try {

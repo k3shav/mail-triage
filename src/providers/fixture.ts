@@ -7,7 +7,7 @@ import type { ClassifierProvider, ClassifyRequest, ProviderInfo } from './types.
 export const FIXTURE_MODEL = 'demo-fixtures-v1';
 
 /**
- * Returns hand-written fixture labels for the bundled demo inbox. It never
+ * Returns hand-written fixture answers for the bundled sample emails. It never
  * classifies arbitrary mail and reports no confidence.
  */
 export class FixtureProvider implements ClassifierProvider {
@@ -25,7 +25,7 @@ export class FixtureProvider implements ClassifierProvider {
       throw new ProviderError({
         provider: 'fixture',
         kind: 'not_configured',
-        message: 'Demo fixtures only cover the bundled demo inbox; configure a model provider for real mail',
+        message: 'Demo fixtures only cover the bundled sample emails; configure a model provider for real mail',
       });
     }
     const fields = Object.fromEntries(

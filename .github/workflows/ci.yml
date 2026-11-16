@@ -19,5 +19,47 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      # Includes the tagging pipeline (dry-run and apply) against a fake Google API,
+      # the setup page, and the CLI. No network.
       - run: npm test
       - run: npm run build
+      - name: Installed CLI runs and reports an unconfigured setup honestly
+        run: |
+          npm pack --pack-destination "$RUNNER_TEMP"
+          mkdir "$RUNNER_TEMP/cli" && cd "$RUNNER_TEMP/cli"
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund "$RUNNER_TEMP"/mail-triage-*.tgz
+          export DATA_DIR="$RUNNER_TEMP/cli-data"
+          ./node_modules/.bin/mail-triage --help
+          ./node_modules/.bin/mail-triage status
+          ./node_modules/.bin/mail-triage categories check node_modules/mail-triage/examples/categories.json
+          set +e
+          ./node_modules/.bin/mail-triage tag; code=$?
+          test "$code" -eq 1 || { echo "tag without setup should exit 1, got $code"; exit 1; }
+          ./node_modules/.bin/mail-triage tag --dry-run --apply; code=$?
+          test "$code" -eq 2 || { echo "conflicting flags should exit 2, got $code"; exit 1; }
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t mail-triage:ci .
+      - name: Refuses to start without APP_PASSWORD
+        run: |
+          if docker run --rm mail-triage:ci; then echo "expected failure"; exit 1; fi
+      - name: Serves health, the setup page, and requires sign-in for the API
+        run: |
+          docker run -d --name mt -p 127.0.0.1:8787:8787 -e APP_PASSWORD=ci-password-123456 mail-triage:ci
+          for i in $(seq 1 20); do curl -fsS http://localhost:8787/api/health && break; sleep 1; done
+          curl -fsS http://localhost:8787/api/health
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8787/api/status)" = 401
+          curl -fsS -D headers.txt http://localhost:8787/ -o page.html
+          grep -qi "content-security-policy: .*script-src 'self'" headers.txt
+          grep -q '<script src="/setup.js" defer></script>' page.html
+          curl -fsS http://localhost:8787/setup.js > /dev/null
+          docker exec mt node dist/node/cli/index.js --help
+          docker exec mt node dist/node/cli/index.js status
+          docker logs mt
+          docker rm -f mt

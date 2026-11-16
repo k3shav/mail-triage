@@ -1,0 +1,40 @@
+{
+  "categories": [
+    {
+      "id": "fyi",
+      "name": "FYI",
+      "description": "Personal or work updates written for me to read, such as announcements, status updates, or shared information, that are not newsletters or automated alerts."
+    },
+    {
+      "id": "marketing",
+      "name": "Marketing",
+      "description": "Promotions, newsletters, product announcements, sales, and other bulk mail sent to many recipients to sell or promote something."
+    },
+    {
+      "id": "comment",
+      "name": "Comment",
+      "description": "A comment, mention, reply, or review on a shared document, issue, pull request, post, or thread."
+    },
+    {
+      "id": "notification",
+      "name": "Notification",
+      "description": "Automated alerts from a service or system, such as security alerts, build results, shipping updates, account changes, or reminders."
+    },
+    {
+      "id": "receipt",
+      "name": "Receipt",
+      "description": "Receipts, invoices, order confirmations, payment confirmations, and billing statements."
+    },
+    {
+      "id": "meeting",
+      "name": "Meeting",
+      "description": "Calendar invitations, meeting requests, scheduling, rescheduling, cancellations, or meeting notes."
+    },
+    {
+      "id": "other",
+      "name": "Other",
+      "description": "Email that does not clearly fit any other category."
+    }
+  ],
+  "userContext": ""
+}

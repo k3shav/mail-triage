@@ -159,25 +159,87 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX runs_by_account ON runs(account_id, kind, id DESC);
   `,
+  // Background labeling. The v1 review-UI tables (corrections, label_previews,
+  // label_applies, runs, gmail_labels) are no longer written and are left in
+  // place untouched. The fictional demo mailbox is removed.
+  `
+  DELETE FROM accounts WHERE kind = 'demo';
+  ALTER TABLE messages ADD COLUMN in_window INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE messages ADD COLUMN classify_failures INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE messages ADD COLUMN classify_failed_revision INTEGER;
+  ALTER TABLE messages ADD COLUMN next_classify_at INTEGER;
+
+  CREATE TABLE message_tags (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    classification_id INTEGER,
+    taxonomy_revision INTEGER NOT NULL,
+    plan_key TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('labeled', 'review', 'labeled_review')),
+    labels TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('planned', 'applied', 'failed', 'skipped')),
+    added TEXT NOT NULL DEFAULT '[]',
+    failures INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER,
+    error TEXT,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX message_tags_by_account ON message_tags(account_id, status);
+
+  CREATE TABLE cycles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT,
+    mode TEXT NOT NULL CHECK (mode IN ('dry-run', 'apply')),
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    status TEXT NOT NULL CHECK (status IN ('running', 'ok', 'partial', 'failed', 'aborted', 'not_ready')),
+    summary TEXT NOT NULL DEFAULT '{}',
+    error TEXT
+  );
+  `,
 ];
 
 export function openDatabase(file: string): Db {
   if (file !== ':memory:') mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const db = new Database(file);
-  db.pragma('journal_mode = WAL');
   db.pragma('busy_timeout = 5000');
+  enableWal(db);
   db.pragma('foreign_keys = ON');
   db.pragma('synchronous = NORMAL');
   migrate(db);
   return db;
 }
 
+/**
+ * Switching a new file to WAL needs an exclusive lock and, unlike other
+ * statements, does not wait on busy_timeout. Retry briefly so processes
+ * that open a new database at the same moment do not fail.
+ */
+function enableWal(db: Db): void {
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      db.pragma('journal_mode = WAL');
+      return;
+    } catch (error) {
+      if ((error as { code?: string }).code !== 'SQLITE_BUSY' || attempt >= 100) throw error;
+      Atomics.wait(pause, 0, 0, 50);
+    }
+  }
+}
+
+/** Each step re-reads the version inside its write lock, so processes opening a new file together migrate it once. */
 function migrate(db: Db): void {
-  const current = db.pragma('user_version', { simple: true }) as number;
-  for (let version = current; version < MIGRATIONS.length; version += 1) {
-    db.transaction(() => {
-      db.exec(MIGRATIONS[version]!);
-      db.pragma(`user_version = ${version + 1}`);
-    }).immediate();
+  for (;;) {
+    const applied = db
+      .transaction(() => {
+        const version = db.pragma('user_version', { simple: true }) as number;
+        if (version >= MIGRATIONS.length) return false;
+        db.exec(MIGRATIONS[version]!);
+        db.pragma(`user_version = ${version + 1}`);
+        return true;
+      })
+      .immediate();
+    if (!applied) return;
   }
 }

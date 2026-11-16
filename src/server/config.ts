@@ -57,8 +57,38 @@ const EnvSchema = z.object({
   SYNC_MAX_MESSAGES: intInRange(50, 1, 200),
   CLASSIFY_BATCH_SIZE: intInRange(20, 1, 100),
   CLASSIFY_CONCURRENCY: intInRange(3, 1, 8),
-  DEMO_INBOX: bool(true),
+  TAG_BATCH_SIZE: intInRange(50, 1, 200),
+  TAGGING_MODE: z.enum(['dry-run', 'apply']).default('dry-run'),
+  POLL_INTERVAL_SECONDS: z
+    .string()
+    .optional()
+    .transform((value, ctx) => {
+      if (value === undefined || value === '') return 120;
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || (parsed !== 0 && (parsed < 15 || parsed > 86_400))) {
+        ctx.addIssue({ code: 'custom', message: 'must be 0 (off) or an integer from 15 to 86400' });
+        return z.NEVER;
+      }
+      return parsed;
+    }),
+  CONFIDENCE_THRESHOLD: z
+    .string()
+    .optional()
+    .transform((value, ctx) => {
+      if (value === undefined || value === '') return 0.7;
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+        ctx.addIssue({ code: 'custom', message: 'must be a number from 0 to 1' });
+        return z.NEVER;
+      }
+      return parsed;
+    }),
+  AUTO_LABEL_UNSCORED: bool(false),
+  CATEGORIES_FILE: z.string().optional(),
+  SETUP_PAGE: bool(true),
 });
+
+export type TaggingMode = 'dry-run' | 'apply';
 
 export interface AppConfig {
   host: string;
@@ -66,6 +96,8 @@ export interface AppConfig {
   publicUrl: URL;
   /** Hosts accepted in the Host header (DNS-rebinding guard). */
   allowedHosts: Set<string>;
+  /** Origins accepted on state-changing requests. */
+  allowedOrigins: Set<string>;
   databasePath: string;
   auth: { mode: 'password'; password: string } | { mode: 'local' };
   sessionTtlMs: number;
@@ -79,7 +111,18 @@ export interface AppConfig {
   syncMaxMessages: number;
   classifyBatchSize: number;
   classifyConcurrency: number;
-  demoInbox: boolean;
+  tagBatchSize: number;
+  /** dry-run never writes to Gmail; apply adds labels. */
+  taggingMode: TaggingMode;
+  /** Background cycle interval for the server; 0 turns the server's own polling off. */
+  pollIntervalMs: number;
+  /** Answers with provider confidence below this get only the Needs Review label. */
+  confidenceThreshold: number;
+  /** Label schema-valid answers that carry no confidence (local models), alongside Needs Review. */
+  autoLabelUnscored: boolean;
+  /** JSON file that defines categories; reloaded before every cycle. Null keeps categories in the database. */
+  categoriesFile: string | null;
+  setupPage: boolean;
 }
 
 export class ConfigError extends Error {
@@ -89,7 +132,9 @@ export class ConfigError extends Error {
 export const MIN_APP_PASSWORD_LENGTH = 12;
 
 export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
-  const parsed = EnvSchema.safeParse(env);
+  // An empty assignment in .env (KEY=) means "not set".
+  const present = Object.fromEntries(Object.entries(env).filter(([, value]) => value !== undefined && value.trim() !== ''));
+  const parsed = EnvSchema.safeParse(present);
   if (!parsed.success) {
     const details = parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; ');
     throw new ConfigError(`Invalid configuration: ${details}`);
@@ -100,7 +145,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   if (password !== undefined && password.length < MIN_APP_PASSWORD_LENGTH) {
     throw new ConfigError(`APP_PASSWORD must be at least ${MIN_APP_PASSWORD_LENGTH} characters`);
   }
-  const displayHost = e.HOST === '0.0.0.0' || e.HOST === '::' ? 'localhost' : e.HOST.includes(':') ? `[${e.HOST}]` : e.HOST;
+  // Loopback defaults to "localhost" so the session cookie and Google's localhost redirect share a host.
+  const displayHost = e.HOST === '0.0.0.0' || e.HOST === '::' || loopback ? 'localhost' : e.HOST.includes(':') ? `[${e.HOST}]` : e.HOST;
   const publicUrl = new URL(e.PUBLIC_URL ?? `http://${displayHost}:${e.PORT}`);
   if (!['http:', 'https:'].includes(publicUrl.protocol)) throw new ConfigError('PUBLIC_URL must be http or https');
   if (!isLoopbackHost(publicUrl.hostname.replace(/^\[|\]$/g, '')) && publicUrl.protocol !== 'https:') {
@@ -130,6 +176,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     for (const name of ['localhost', '127.0.0.1', '[::1]']) allowedHosts.add(`${name}:${e.PORT}`);
   }
 
+  const allowedOrigins = new Set([...allowedHosts].map((host) => `${publicUrl.protocol}//${host}`));
+
   const googleMissing: string[] = [];
   if (!e.GOOGLE_CLIENT_ID) googleMissing.push('GOOGLE_CLIENT_ID');
   if (!e.GOOGLE_CLIENT_SECRET) googleMissing.push('GOOGLE_CLIENT_SECRET');
@@ -145,6 +193,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     port: e.PORT,
     publicUrl,
     allowedHosts,
+    allowedOrigins,
     databasePath: e.DATABASE_PATH ? path.resolve(e.DATABASE_PATH) : path.join(dataDir, 'mail-triage.sqlite'),
     auth: password ? { mode: 'password', password } : { mode: 'local' },
     sessionTtlMs: e.SESSION_TTL_HOURS * 3600_000,
@@ -161,7 +210,13 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     syncMaxMessages: e.SYNC_MAX_MESSAGES,
     classifyBatchSize: e.CLASSIFY_BATCH_SIZE,
     classifyConcurrency: e.CLASSIFY_CONCURRENCY,
-    demoInbox: e.DEMO_INBOX,
+    tagBatchSize: e.TAG_BATCH_SIZE,
+    taggingMode: e.TAGGING_MODE,
+    pollIntervalMs: e.POLL_INTERVAL_SECONDS * 1000,
+    confidenceThreshold: e.CONFIDENCE_THRESHOLD,
+    autoLabelUnscored: e.AUTO_LABEL_UNSCORED,
+    categoriesFile: e.CATEGORIES_FILE ? path.resolve(e.CATEGORIES_FILE) : null,
+    setupPage: e.SETUP_PAGE,
   };
 }
 

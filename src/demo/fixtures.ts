@@ -2,7 +2,7 @@ import type { EmailForModel } from '../core/email.js';
 import type { ActionId, PriorityId } from '../core/taxonomy.js';
 
 /**
- * A fictional inbox for demo mode. Every address uses reserved example
+ * Fictional sample emails for `npm run classify -- --demo`. Every address uses reserved example
  * domains. The `fixture` values were written by hand for the default
  * categories; they are not model output and carry no confidence.
  */

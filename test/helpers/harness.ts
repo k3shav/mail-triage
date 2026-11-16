@@ -89,7 +89,6 @@ export function createHarness(options: { env?: Record<string, string>; model?: S
     model: setup,
     fetch: google.fetch,
     now,
-    webRoot: '/nonexistent',
     log: (message) => logs.push(message),
   });
   return { app, context, store, google, model: model ?? new ScriptedModel(), logs, clock };
@@ -117,6 +116,10 @@ export class Client {
     return this.agent.put(path).set('Host', 'localhost:8787').set('Origin', ORIGIN).set('x-csrf-token', this.csrf).send(body as object);
   }
 
+  delete(path: string) {
+    return this.agent.delete(path).set('Host', 'localhost:8787').set('Origin', ORIGIN).set('x-csrf-token', this.csrf);
+  }
+
   async signIn(): Promise<this> {
     const response = await this.post('/api/session/local');
     if (response.status !== 200) throw new Error(`sign-in failed: ${response.status} ${JSON.stringify(response.body)}`);
@@ -131,4 +134,13 @@ export class Client {
     const state = new URL(start.body.url).searchParams.get('state')!;
     return this.get(`/api/gmail/oauth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`);
   }
+}
+
+/** A harness with Gmail connected through the fake OAuth round trip. */
+export async function connectedHarness(options: Parameters<typeof createHarness>[0] = {}): Promise<Harness & { client: Client }> {
+  const h = createHarness(options);
+  const client = await new Client(h.app).signIn();
+  const response = await client.connectGmail();
+  if (!String(response.headers.location).endsWith('?gmail=connected')) throw new Error(`connect failed: ${String(response.headers.location)}`);
+  return { ...h, client };
 }

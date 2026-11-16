@@ -9,7 +9,7 @@ This idea already exists in several forms. A new classifier should not claim to 
 | Project | Documented scope | Implication for this project |
 | --- | --- | --- |
 | [Jev Mail Classifier](https://github.com/parth-kp/jev-mail-classifier) | Jev-based inbox classification and config-driven mailbox actions | Closest existing project; users happy with that workflow should evaluate it first. |
-| [Inbox Zero](https://github.com/elie222/inbox-zero) | Open-source email client and AI assistant, Gmail/Outlook, plain-language rules, self-hosting | A broader existing option. Mail Triage targets a focused single-user classifier with fewer services. |
+| [Inbox Zero](https://github.com/elie222/inbox-zero) | Open-source email client and AI assistant, Gmail/Outlook, plain-language rules, self-hosting | A broader existing option. Mail Triage is a focused single-user background labeler with no inbox UI and fewer services. |
 
 The comparison is documentation-based; neither project was installed or benchmarked for this research. No source code from either project is copied into Mail Triage.
 
@@ -28,9 +28,9 @@ Category and action answer different questions. A deployment notification might 
 - Category: FYI, Marketing, Comment, Notification, Receipt, Meeting, Other. Users can change names and plain-language definitions.
 - Action: Needs Response, Needs Action, No Action.
 - Priority: Low, Normal, High.
-- Review: uncertain, refused, or invalid predictions require review. Human corrections remain distinct from model predictions.
+- Review: uncertain, refused, or invalid predictions must stay visible as uncertain. In the shipped product they get only a `Needs Review` Gmail label and no guessed category; confidence-less answers from language models are labeled only on explicit opt-in, still with `Needs Review`, and never with an invented confidence.
 
-Configuration revisions must be attached to classifications. Editing a definition must not silently authorize applying a stale result. Do not pretend a keyword demo classifies arbitrary mail with AI.
+Configuration revisions must be attached to classifications. Editing a definition must not silently authorize labeling with a stale result. Do not pretend a keyword demo classifies arbitrary mail with AI.
 
 ## Gmail and deployment boundaries
 
@@ -38,9 +38,20 @@ The user selected Gmail OAuth as the first connector. [Google's web-server OAuth
 
 [Gmail scopes](https://developers.google.com/workspace/gmail/api/auth/scopes) distinguish reading messages from editing labels. Applying labels to a message uses [`users.messages.modify`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/modify), which needs `gmail.modify` (or another documented applicable scope). That grant is broader than the app's intended additive-label operation. Document it honestly. Public distribution can require Google verification; users running their own OAuth project must follow Google's testing/consent rules.
 
-The intended operation is an explicit preview followed by per-message application of namespaced labels using `addLabelIds` only. It does not change unread state, remove labels, archive, delete, or send. Never classify or modify the developer's own mailbox during automated verification.
+## Product scope revision: background labeler
 
-Mac and server runs share one runtime and persistent storage. Loopback is the local default; a remotely reachable server requires authentication and HTTPS termination. Email bodies are private local data; ignore database files and credentials in Git. Render plain text, with no remote image loading or email HTML execution.
+The first iteration put a separate inbox UI with per-message review and preview/apply in front of Gmail. The user's direction ("I don't want a separate inbox UI - I just want it to tag things on my gmail") replaced that: Gmail stays the only inbox, and Mail Triage runs in the background, adding namespaced labels with `addLabelIds` only. The browser is used once, to connect Gmail.
+
+Consequences:
+
+- Writes are automatic, so the safety checks that a human click used to provide moved into the pipeline: a default dry-run mode that never writes, an explicit `TAGGING_MODE=apply` that also requires `GMAIL_LABEL_WRITES=true` and a granted `gmail.modify`, one renewable owner-checked lease per cycle, and a re-check of the configuration revision, message, thread, and classification immediately before each write.
+- Uncertainty must be visible where the user reads mail, so it becomes a Gmail label (`<prefix>/Needs Review`) instead of a review queue.
+- It does not change unread state, remove labels, archive, delete, or send. Labels accumulate when categories change; that trade-off is documented rather than solved with removals.
+- Polling (default every 120 s, bounded batches) is used instead of Gmail push notifications, which need a Pub/Sub topic and a public endpoint and are out of scope for a single-user MVP.
+
+Never classify or modify the developer's own mailbox during automated verification.
+
+Mac and server runs share one runtime and persistent storage. Loopback is the local default; a remotely reachable setup page requires authentication and HTTPS termination. Running the app locally is not the same as local inference: with Jev or OpenAI, classified email text still goes to that provider. Email bodies are private local data; ignore database files and credentials in Git, and keep message content out of logs and status output.
 
 ## Provider wire details used by the adapters
 
@@ -61,7 +72,7 @@ Implementation consequences:
 
 - The Jev reference documents 400/422 error bodies and no refusal answer type. The adapter still accepts `type: "refusal"` defensively and treats any other unexpected answer as invalid.
 - OpenAI refusals are per question; other answers in the same response remain usable.
-- Validation is strict: a confidence outside 0–1, a choice that was not offered, a choice that is not the most probable option, duplicate or unknown probability keys, or a distribution that does not sum to 1 within 0.02 makes that field invalid. Invalid and refused fields always need human review. Nothing is clamped.
+- Validation is strict: a confidence outside 0–1, a choice that was not offered, a choice that is not the most probable option, duplicate or unknown probability keys, or a distribution that does not sum to 1 within 0.02 makes that field invalid. Invalid and refused fields always get only the Needs Review label. Nothing is clamped.
 - Error bodies (Jev 422 includes an `input` preview) can echo email text, so error messages keep only HTTP status and short error codes.
 - 408, 429, 5xx, timeouts, and network failures retry with bounded exponential backoff (default two retries, `Retry-After` honored up to 8 s). Other 4xx errors fail immediately. The AI SDK path uses the SDK's own bounded `maxRetries`.
 - The Vercel AI SDK 7 also ships an experimental `decide` API. This project does not use it for Jev or OpenAI, to keep the request and response contract exactly as each provider documents it.
