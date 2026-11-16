@@ -58,6 +58,7 @@ const EnvSchema = z.object({
   CLASSIFY_BATCH_SIZE: intInRange(20, 1, 100),
   CLASSIFY_CONCURRENCY: intInRange(3, 1, 8),
   DEMO_INBOX: bool(true),
+  WEB_DEV_URL: z.string().url().optional(),
 });
 
 export interface AppConfig {
@@ -66,6 +67,10 @@ export interface AppConfig {
   publicUrl: URL;
   /** Hosts accepted in the Host header (DNS-rebinding guard). */
   allowedHosts: Set<string>;
+  /** Origins accepted on state-changing requests. */
+  allowedOrigins: Set<string>;
+  /** Where the browser app lives when it differs from PUBLIC_URL (Vite dev server). */
+  appUrl: URL;
   databasePath: string;
   auth: { mode: 'password'; password: string } | { mode: 'local' };
   sessionTtlMs: number;
@@ -89,7 +94,9 @@ export class ConfigError extends Error {
 export const MIN_APP_PASSWORD_LENGTH = 12;
 
 export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
-  const parsed = EnvSchema.safeParse(env);
+  // An empty assignment in .env (KEY=) means "not set".
+  const present = Object.fromEntries(Object.entries(env).filter(([, value]) => value !== undefined && value.trim() !== ''));
+  const parsed = EnvSchema.safeParse(present);
   if (!parsed.success) {
     const details = parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; ');
     throw new ConfigError(`Invalid configuration: ${details}`);
@@ -100,7 +107,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   if (password !== undefined && password.length < MIN_APP_PASSWORD_LENGTH) {
     throw new ConfigError(`APP_PASSWORD must be at least ${MIN_APP_PASSWORD_LENGTH} characters`);
   }
-  const displayHost = e.HOST === '0.0.0.0' || e.HOST === '::' ? 'localhost' : e.HOST.includes(':') ? `[${e.HOST}]` : e.HOST;
+  // Loopback defaults to "localhost" so the session cookie and Google's localhost redirect share a host.
+  const displayHost = e.HOST === '0.0.0.0' || e.HOST === '::' || loopback ? 'localhost' : e.HOST.includes(':') ? `[${e.HOST}]` : e.HOST;
   const publicUrl = new URL(e.PUBLIC_URL ?? `http://${displayHost}:${e.PORT}`);
   if (!['http:', 'https:'].includes(publicUrl.protocol)) throw new ConfigError('PUBLIC_URL must be http or https');
   if (!isLoopbackHost(publicUrl.hostname.replace(/^\[|\]$/g, '')) && publicUrl.protocol !== 'https:') {
@@ -130,6 +138,17 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     for (const name of ['localhost', '127.0.0.1', '[::1]']) allowedHosts.add(`${name}:${e.PORT}`);
   }
 
+  const allowedOrigins = new Set([...allowedHosts].map((host) => `${publicUrl.protocol}//${host}`));
+  let appUrl = publicUrl;
+  if (e.WEB_DEV_URL) {
+    const dev = new URL(e.WEB_DEV_URL);
+    if (dev.protocol !== 'http:' || !isLoopbackHost(dev.hostname.replace(/^\[|\]$/g, '')) || !loopback) {
+      throw new ConfigError('WEB_DEV_URL is for local development only: it must be an http loopback URL on a loopback server');
+    }
+    appUrl = dev;
+    allowedOrigins.add(dev.origin);
+  }
+
   const googleMissing: string[] = [];
   if (!e.GOOGLE_CLIENT_ID) googleMissing.push('GOOGLE_CLIENT_ID');
   if (!e.GOOGLE_CLIENT_SECRET) googleMissing.push('GOOGLE_CLIENT_SECRET');
@@ -145,6 +164,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     port: e.PORT,
     publicUrl,
     allowedHosts,
+    allowedOrigins,
+    appUrl,
     databasePath: e.DATABASE_PATH ? path.resolve(e.DATABASE_PATH) : path.join(dataDir, 'mail-triage.sqlite'),
     auth: password ? { mode: 'password', password } : { mode: 'local' },
     sessionTtlMs: e.SESSION_TTL_HOURS * 3600_000,

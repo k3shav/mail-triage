@@ -21,7 +21,7 @@ Commands:
 sync and classify never change Gmail. Labels are applied only from the web UI,
 one previewed message at a time. To poll, schedule sync and classify with cron
 or launchd, for example every 15 minutes:
-  */15 * * * * cd /path/to/mail-triage && node dist/node/cli/index.js sync && node dist/node/cli/index.js classify`;
+  */15 * * * * cd /path/to/mail-triage && npm run --silent cli -- sync && npm run --silent cli -- classify`;
 
 async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;

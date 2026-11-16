@@ -137,7 +137,7 @@ export function requireSameOrigin(config: AppConfig): RequestHandler {
     if (SAFE_METHODS.has(req.method)) return next();
     const origin = req.headers.origin;
     if (origin !== undefined) {
-      if (origin !== config.publicUrl.origin) return next(new AppError(403, 'bad_origin', 'Cross-origin request refused'));
+      if (!config.allowedOrigins.has(origin)) return next(new AppError(403, 'bad_origin', 'Cross-origin request refused'));
     } else if (req.headers['sec-fetch-site'] !== 'same-origin') {
       return next(new AppError(403, 'bad_origin', 'Request origin could not be verified'));
     }

@@ -161,7 +161,7 @@ export function createApp(deps: AppDeps): { app: express.Express; context: AppCo
 
   // OAuth callback is a top-level GET from Google; it is bound to the session through the state.
   api.get('/gmail/oauth/callback', async (req, res) => {
-    const redirect = (params: Record<string, string>) => res.redirect(303, `/?${new URLSearchParams(params)}`);
+    const redirect = (params: Record<string, string>) => res.redirect(303, new URL(`/?${new URLSearchParams(params)}`, config.appUrl).toString());
     if (!req.session) return redirect({ gmail: 'error', reason: 'session_missing' });
     const result = await connection.handleCallback(
       { code: req.query.code, state: req.query.state, error: req.query.error },
@@ -195,6 +195,7 @@ export function createApp(deps: AppDeps): { app: express.Express; context: AppCo
     const { revision, hash } = store.currentTaxonomy();
     res.json({
       auth: { mode: config.auth.mode },
+      publicUrl: config.publicUrl.origin,
       model: deps.model.status,
       gmail: {
         configured: connection.configurationProblem() === null,

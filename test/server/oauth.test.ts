@@ -88,11 +88,11 @@ describe('Gmail OAuth flow', () => {
     const start = await client.post('/api/gmail/connect');
     const state = new URL(start.body.url).searchParams.get('state')!;
     const denied = await client.get(`/api/gmail/oauth/callback?error=access_denied&state=${state}&error_description=%3Cscript%3E`);
-    expect(String(denied.headers.location)).toBe('/?gmail=error&reason=access_denied');
+    expect(String(denied.headers.location)).toBe('http://localhost:8787/?gmail=error&reason=access_denied');
     const weird = await client.get('/api/gmail/oauth/callback?error=%3Cimg%20src%3Dx%3E');
-    expect(String(weird.headers.location)).toBe('/?gmail=error&reason=oauth_error');
+    expect(String(weird.headers.location)).toBe('http://localhost:8787/?gmail=error&reason=oauth_error');
     const noSession = await new Client(h.app).get(`/api/gmail/oauth/callback?code=good-code&state=${state}`);
-    expect(String(noSession.headers.location)).toBe('/?gmail=error&reason=session_missing');
+    expect(String(noSession.headers.location)).toBe('http://localhost:8787/?gmail=error&reason=session_missing');
     const badCode = await client.connectGmail('bad-code');
     expect(location(badCode).searchParams.get('reason')).toBe('token_exchange_failed');
   });
