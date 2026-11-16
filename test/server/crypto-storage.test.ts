@@ -3,7 +3,6 @@ import { DEFAULT_TAXONOMY } from '../../src/core/taxonomy.js';
 import { EncryptionKeyError, SecretBox, keyFingerprint, parseEncryptionKey } from '../../src/server/crypto.js';
 import { openDatabase } from '../../src/server/db/database.js';
 import { StaleRevisionError, Store } from '../../src/server/db/store.js';
-import { seedDemoInbox } from '../../src/server/services/sync.js';
 
 describe('token encryption', () => {
   const key = parseEncryptionKey(Buffer.alloc(32, 1).toString('base64'));
@@ -48,47 +47,67 @@ describe('storage', () => {
     expect(s.updateTaxonomy(edited, 2).changed).toBe(false);
   });
 
-  it('dedupes messages by account and external id', () => {
-    const s = store();
-    expect(seedDemoInbox(s)).toBe(12);
-    expect(seedDemoInbox(s)).toBe(0);
-    expect(s.countMessages('demo')).toBe(12);
+  const account = (s: Store) =>
+    s.insertGmailAccount({ id: 'gmail_test', email: 'me@example.com', grantedScopes: [], refreshTokenEnc: 'v1.x.y.z', keyFingerprint: 'f' });
+  const message = (id: string) => ({
+    accountId: 'gmail_test',
+    externalId: id,
+    threadId: `t${id}`,
+    from: 'a@example.com',
+    to: 'b@example.com',
+    cc: '',
+    subject: 's',
+    sentAt: '2026-11-16T00:00:00.000Z',
+    internalDate: 1,
+    snippet: '',
+    bodyText: 'body',
+    bodySource: 'plain' as const,
+    bodyTruncated: false,
+    signals: { hasListUnsubscribe: false, listId: null, autoSubmitted: null, precedence: null },
+    labelIds: ['INBOX'],
+    unread: false,
   });
 
-  it('increments a per-message decision sequence across classifications and corrections', () => {
+  it('dedupes messages by account and external id', () => {
     const s = store();
-    seedDemoInbox(s);
-    const [message] = s.listMessages('demo', 1);
+    account(s);
+    expect(s.insertMessage(message('m1'))).not.toBeNull();
+    expect(s.insertMessage(message('m1'))).toBeNull();
+    expect(s.countMessages('gmail_test')).toBe(1);
+  });
+
+  it('increments a per-message decision sequence and refuses results computed against an older one', () => {
+    const s = store();
+    account(s);
+    const id = s.insertMessage(message('m1'))!;
     const answered = { status: 'answered' as const, value: 'fyi', confidence: null, selectedProbability: null, probabilities: null };
-    const c = s.insertClassification({
-      accountId: 'demo',
-      messageId: message!.id,
-      taxonomyRevision: 1,
-      taxonomyHash: s.currentTaxonomy().hash,
-      promptVersion: 'p',
-      decision: {
-        provider: 'fixture',
-        requestedModel: 'm',
-        model: 'm',
-        confidenceKind: 'none',
-        fields: { category: answered, action: { ...answered, value: 'no_action' }, priority: { ...answered, value: 'low' } },
-        usage: null,
-      },
-      expectedDecisionSeq: 0,
-    })!;
-    const k = s.insertCorrection({
-      accountId: 'demo',
-      messageId: message!.id,
-      expectedTaxonomyRevision: 1,
-      expectedDecisionSeq: 1,
-      kind: 'edit',
-      category: 'receipt',
-      action: 'no_action',
-      priority: 'low',
-      basedOnClassificationId: c.id,
-    });
-    expect([c.seq, k.seq]).toEqual([1, 2]);
-    expect(s.getMessage('demo', message!.id)!.decisionSeq).toBe(2);
+    const insert = (expectedDecisionSeq: number) =>
+      s.insertClassification({
+        accountId: 'gmail_test',
+        messageId: id,
+        taxonomyRevision: 1,
+        taxonomyHash: s.currentTaxonomy().hash,
+        promptVersion: 'p',
+        decision: {
+          provider: 'fixture',
+          requestedModel: 'm',
+          model: 'm',
+          confidenceKind: 'none',
+          fields: { category: answered, action: { ...answered, value: 'no_action' }, priority: { ...answered, value: 'low' } },
+          usage: null,
+        },
+        expectedDecisionSeq,
+      });
+    expect(insert(0)!.seq).toBe(1);
+    expect(insert(0)).toBeNull();
+    expect(insert(1)!.seq).toBe(2);
+    expect(s.getMessage('gmail_test', id)!.decisionSeq).toBe(2);
+  });
+
+  it('replaces the taxonomy only when its content changes', () => {
+    const s = store();
+    expect(s.replaceTaxonomy(structuredClone(DEFAULT_TAXONOMY))).toMatchObject({ changed: false, revision: { revision: 1 } });
+    expect(s.replaceTaxonomy({ ...DEFAULT_TAXONOMY, userContext: 'Bakery owner.' })).toMatchObject({ changed: true, revision: { revision: 2 } });
   });
 
   it('grants a lock to one owner until it is released or expires', () => {

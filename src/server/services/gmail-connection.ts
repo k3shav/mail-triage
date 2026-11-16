@@ -224,7 +224,7 @@ export class GmailConnection {
   private async refresh(accountId: string): Promise<string> {
     const client = this.oauthClient();
     const account = this.store.getAccount(accountId);
-    if (!account || account.kind !== 'gmail' || !account.refreshTokenEnc) {
+    if (!account || !account.refreshTokenEnc) {
       throw new AppError(409, 'gmail_not_connected', 'Gmail is not connected');
     }
     if (this.keyMismatch(account)) {
@@ -254,8 +254,8 @@ export class GmailConnection {
     }
   }
 
-  client(accountId: string): GmailClient {
-    return new GmailClient({ tokens: this.tokenSource(accountId), fetch: this.fetchImpl });
+  client(accountId: string, signal?: AbortSignal): GmailClient {
+    return new GmailClient({ tokens: this.tokenSource(accountId), fetch: this.fetchImpl, signal });
   }
 
   /** Revoke at Google (best effort) and delete the account with all local mail data. */

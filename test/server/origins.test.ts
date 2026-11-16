@@ -4,7 +4,7 @@ import { loadConfig } from '../../src/server/config.js';
 import { GmailClient } from '../../src/server/gmail/client.js';
 import { Client, createHarness } from '../helpers/harness.js';
 
-describe('loopback origins and dev server', () => {
+describe('loopback origins', () => {
   it('defaults PUBLIC_URL to localhost and accepts every loopback alias of this port', async () => {
     const config = loadConfig({});
     expect(config.publicUrl.origin).toBe('http://localhost:8787');
@@ -19,18 +19,13 @@ describe('loopback origins and dev server', () => {
     expect(otherPort.status).toBe(403);
   });
 
-  it('allows a loopback WEB_DEV_URL only on loopback servers and redirects OAuth results there', async () => {
-    expect(() => loadConfig({ WEB_DEV_URL: 'http://evil.example:5173' })).toThrow(/loopback/);
-    expect(() =>
-      loadConfig({ HOST: '0.0.0.0', APP_PASSWORD: 'correct horse battery', PUBLIC_URL: 'https://mail.example.com', WEB_DEV_URL: 'http://localhost:5173' }),
-    ).toThrow(/loopback/);
-
+  it('sends OAuth results back to PUBLIC_URL and ignores the removed WEB_DEV_URL', async () => {
     const h = createHarness({ env: { WEB_DEV_URL: 'http://localhost:5173' } });
     const client = await new Client(h.app).signIn();
     const response = await client.get('/api/gmail/oauth/callback?error=access_denied');
-    expect(String(response.headers.location)).toBe('http://localhost:5173/?gmail=error&reason=access_denied');
+    expect(String(response.headers.location)).toBe('http://localhost:8787/?gmail=error&reason=access_denied');
     const dev = await request(h.app).post('/api/session/local').set('Host', 'localhost:8787').set('Origin', 'http://localhost:5173');
-    expect(dev.status).toBe(200);
+    expect(dev.status).toBe(403);
   });
 });
 

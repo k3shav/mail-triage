@@ -73,6 +73,8 @@ export interface GmailClientOptions {
   sleep?: (ms: number) => Promise<void>;
   maxRetries?: number;
   timeoutMs?: number;
+  /** Aborts in-flight requests and prevents new ones (shutdown, lost lease). */
+  signal?: AbortSignal;
 }
 
 /**
@@ -120,6 +122,13 @@ export class GmailClient {
     return message;
   }
 
+  /** Headers only; used when a full message is too large to read. */
+  async getMessageMetadata(id: string): Promise<GmailFullMessage> {
+    const message = FullMessageSchema.parse(await this.request('GET', `/messages/${this.id(id)}?format=metadata`));
+    this.assertSameId(id, message.id);
+    return message;
+  }
+
   async getMessageMinimal(id: string): Promise<GmailMinimalMessage> {
     const message = MinimalMessageSchema.parse(await this.request('GET', `/messages/${this.id(id)}?format=minimal`));
     this.assertSameId(id, message.id);
@@ -156,10 +165,13 @@ export class GmailClient {
 
   private async request(method: 'GET' | 'POST', path: string, body?: unknown, maxBytes = MAX_RESPONSE_BYTES): Promise<unknown> {
     let refreshed = false;
+    const external = this.options.signal;
     for (let attempt = 0; ; attempt += 1) {
+      if (external?.aborted) throw new GmailApiError(0, 'aborted', 'Gmail request cancelled');
       const token = await this.options.tokens.get();
       let response: Response;
       try {
+        const timeout = AbortSignal.timeout(this.timeoutMs);
         response = await this.fetchImpl(`${GMAIL_API}${path}`, {
           method,
           headers: {
@@ -168,10 +180,11 @@ export class GmailClient {
             ...(body === undefined ? {} : { 'content-type': 'application/json' }),
           },
           body: body === undefined ? undefined : JSON.stringify(body),
-          signal: AbortSignal.timeout(this.timeoutMs),
+          signal: external ? AbortSignal.any([timeout, external]) : timeout,
           redirect: 'error',
         });
       } catch {
+        if (external?.aborted) throw new GmailApiError(0, 'aborted', 'Gmail request cancelled');
         if (attempt < this.maxRetries) {
           await this.sleep(500 * 2 ** attempt);
           continue;
@@ -186,6 +199,7 @@ export class GmailClient {
           if (error instanceof BodyTooLargeError) {
             throw new GmailApiError(502, 'too_large', `Gmail response is larger than ${Math.round(maxBytes / 1024)} KiB; skipped`);
           }
+          if (external?.aborted) throw new GmailApiError(0, 'aborted', 'Gmail request cancelled');
           throw new GmailApiError(0, 'network', 'Gmail response was interrupted');
         }
         try {

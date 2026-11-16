@@ -1,6 +1,7 @@
 # docker compose up -d --build
 # Requires a .env file (copy .env.example). APP_PASSWORD is mandatory in the container
 # because it listens on 0.0.0.0 inside the container.
+# CLI: docker compose exec mail-triage node dist/node/cli/index.js status
 services:
   mail-triage:
     build: .
@@ -12,11 +13,14 @@ services:
       PORT: "8787"
       DATA_DIR: /data
     ports:
-      # Published on the host's loopback only. For remote access, put an HTTPS
-      # reverse proxy in front instead of publishing on 0.0.0.0.
+      # Published on the host's loopback only. The browser is needed once, to
+      # connect Gmail; for remote setup, put an HTTPS reverse proxy in front.
       - "127.0.0.1:8787:8787"
     volumes:
       - mail-triage-data:/data
+      # Optional categories file, reloaded before every cycle.
+      # Also set CATEGORIES_FILE=/config/categories.json in .env.
+      # - ./my-categories.json:/config/categories.json:ro
 
 volumes:
   mail-triage-data:

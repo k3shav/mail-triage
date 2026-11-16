@@ -57,9 +57,38 @@ const EnvSchema = z.object({
   SYNC_MAX_MESSAGES: intInRange(50, 1, 200),
   CLASSIFY_BATCH_SIZE: intInRange(20, 1, 100),
   CLASSIFY_CONCURRENCY: intInRange(3, 1, 8),
-  DEMO_INBOX: bool(true),
-  WEB_DEV_URL: z.string().url().optional(),
+  TAG_BATCH_SIZE: intInRange(50, 1, 200),
+  TAGGING_MODE: z.enum(['dry-run', 'apply']).default('dry-run'),
+  POLL_INTERVAL_SECONDS: z
+    .string()
+    .optional()
+    .transform((value, ctx) => {
+      if (value === undefined || value === '') return 120;
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || (parsed !== 0 && (parsed < 15 || parsed > 86_400))) {
+        ctx.addIssue({ code: 'custom', message: 'must be 0 (off) or an integer from 15 to 86400' });
+        return z.NEVER;
+      }
+      return parsed;
+    }),
+  CONFIDENCE_THRESHOLD: z
+    .string()
+    .optional()
+    .transform((value, ctx) => {
+      if (value === undefined || value === '') return 0.7;
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+        ctx.addIssue({ code: 'custom', message: 'must be a number from 0 to 1' });
+        return z.NEVER;
+      }
+      return parsed;
+    }),
+  AUTO_LABEL_UNSCORED: bool(false),
+  CATEGORIES_FILE: z.string().optional(),
+  SETUP_PAGE: bool(true),
 });
+
+export type TaggingMode = 'dry-run' | 'apply';
 
 export interface AppConfig {
   host: string;
@@ -69,8 +98,6 @@ export interface AppConfig {
   allowedHosts: Set<string>;
   /** Origins accepted on state-changing requests. */
   allowedOrigins: Set<string>;
-  /** Where the browser app lives when it differs from PUBLIC_URL (Vite dev server). */
-  appUrl: URL;
   databasePath: string;
   auth: { mode: 'password'; password: string } | { mode: 'local' };
   sessionTtlMs: number;
@@ -84,7 +111,18 @@ export interface AppConfig {
   syncMaxMessages: number;
   classifyBatchSize: number;
   classifyConcurrency: number;
-  demoInbox: boolean;
+  tagBatchSize: number;
+  /** dry-run never writes to Gmail; apply adds labels. */
+  taggingMode: TaggingMode;
+  /** Background cycle interval for the server; 0 turns the server's own polling off. */
+  pollIntervalMs: number;
+  /** Answers with provider confidence below this get only the Needs Review label. */
+  confidenceThreshold: number;
+  /** Label schema-valid answers that carry no confidence (local models), alongside Needs Review. */
+  autoLabelUnscored: boolean;
+  /** JSON file that defines categories; reloaded before every cycle. Null keeps categories in the database. */
+  categoriesFile: string | null;
+  setupPage: boolean;
 }
 
 export class ConfigError extends Error {
@@ -139,15 +177,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   }
 
   const allowedOrigins = new Set([...allowedHosts].map((host) => `${publicUrl.protocol}//${host}`));
-  let appUrl = publicUrl;
-  if (e.WEB_DEV_URL) {
-    const dev = new URL(e.WEB_DEV_URL);
-    if (dev.protocol !== 'http:' || !isLoopbackHost(dev.hostname.replace(/^\[|\]$/g, '')) || !loopback) {
-      throw new ConfigError('WEB_DEV_URL is for local development only: it must be an http loopback URL on a loopback server');
-    }
-    appUrl = dev;
-    allowedOrigins.add(dev.origin);
-  }
 
   const googleMissing: string[] = [];
   if (!e.GOOGLE_CLIENT_ID) googleMissing.push('GOOGLE_CLIENT_ID');
@@ -165,7 +194,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     publicUrl,
     allowedHosts,
     allowedOrigins,
-    appUrl,
     databasePath: e.DATABASE_PATH ? path.resolve(e.DATABASE_PATH) : path.join(dataDir, 'mail-triage.sqlite'),
     auth: password ? { mode: 'password', password } : { mode: 'local' },
     sessionTtlMs: e.SESSION_TTL_HOURS * 3600_000,
@@ -182,7 +210,13 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     syncMaxMessages: e.SYNC_MAX_MESSAGES,
     classifyBatchSize: e.CLASSIFY_BATCH_SIZE,
     classifyConcurrency: e.CLASSIFY_CONCURRENCY,
-    demoInbox: e.DEMO_INBOX,
+    tagBatchSize: e.TAG_BATCH_SIZE,
+    taggingMode: e.TAGGING_MODE,
+    pollIntervalMs: e.POLL_INTERVAL_SECONDS * 1000,
+    confidenceThreshold: e.CONFIDENCE_THRESHOLD,
+    autoLabelUnscored: e.AUTO_LABEL_UNSCORED,
+    categoriesFile: e.CATEGORIES_FILE ? path.resolve(e.CATEGORIES_FILE) : null,
+    setupPage: e.SETUP_PAGE,
   };
 }
 

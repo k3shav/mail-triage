@@ -1,7 +1,7 @@
 {
   "name": "mail-triage",
   "version": "0.1.0",
-  "description": "Gmail-first email classifier with configurable categories, separate action and priority decisions, and explicit review before labels change.",
+  "description": "Background Gmail labeler: classifies new mail into your own categories plus separate action and priority, and adds namespaced labels in Gmail.",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -9,11 +9,11 @@
     "node": ">=22.12"
   },
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "build": "tsc -p tsconfig.build.json && vite build",
-    "dev": "concurrently -k -n api,web -c blue,magenta \"WEB_DEV_URL=http://localhost:5173 tsx watch --env-file-if-exists=.env src/server/main.ts\" \"vite\"",
+    "build": "node scripts/build.mjs clean && tsc -p tsconfig.build.json && node scripts/build.mjs assets",
+    "dev": "tsx watch --env-file-if-exists=.env src/server/main.ts",
     "start": "node --env-file-if-exists=.env dist/node/server/main.js",
     "cli": "node --env-file-if-exists=.env dist/node/cli/index.js",
     "classify": "tsx --env-file-if-exists=.env src/cli/classify-file.ts"
@@ -26,23 +26,13 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@testing-library/dom": "^10.4.2",
-    "@testing-library/react": "^16.3.3",
     "@types/better-sqlite3": "^9.6.0",
     "@types/express": "^5.0.6",
     "@types/node": "^22.20.5",
-    "@types/react": "^19.3.0",
-    "@types/react-dom": "^19.3.0",
     "@types/supertest": "^7.2.1",
-    "@vitejs/plugin-react": "^6.3.0",
-    "concurrently": "^10.0.7",
-    "jsdom": "^31.0.1",
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1",
     "supertest": "^7.3.2",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
-    "vite": "^8.3.8",
     "vitest": "^5.1.0"
   },
   "bin": {
@@ -50,6 +40,7 @@
   },
   "files": [
     "dist",
+    "examples",
     "README.md",
     "LICENSE",
     ".env.example"

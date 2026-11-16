@@ -12,7 +12,7 @@ describe('startup configuration', () => {
 
   it('requires a password when a public URL or proxy puts a loopback bind on the network', () => {
     // A reverse proxy forwarding https://mail.example.com to 127.0.0.1 makes the app public.
-    expect(() => loadConfig({ HOST: '127.0.0.1', PUBLIC_URL: 'https://mail.example.com', DEMO_INBOX: 'false' })).toThrow(/APP_PASSWORD/);
+    expect(() => loadConfig({ HOST: '127.0.0.1', PUBLIC_URL: 'https://mail.example.com' })).toThrow(/APP_PASSWORD/);
     expect(() => loadConfig({ HOST: '::1', PUBLIC_URL: 'https://mail.example.com' })).toThrow(/APP_PASSWORD/);
     expect(() => loadConfig({ HOST: '127.0.0.1', TRUST_PROXY: 'true' })).toThrow(/TRUST_PROXY requires APP_PASSWORD/);
     expect(() => loadConfig({ PUBLIC_URL: 'http://localhost:8787', TRUST_PROXY: 'true' })).toThrow(/TRUST_PROXY/);
@@ -37,13 +37,22 @@ describe('startup configuration', () => {
     expect(() => loadConfig({ GOOGLE_REDIRECT_URI: 'https://elsewhere.example/cb' })).toThrow(/same origin/);
   });
 
-  it('defaults to loopback with local sessions and read-only Gmail scope', () => {
+  it('defaults to loopback, local sessions, read-only Gmail scope, and dry-run tagging', () => {
     const config = loadConfig({});
     expect(config.host).toBe('127.0.0.1');
     expect(config.auth.mode).toBe('local');
     expect(config.labelWrites).toBe(false);
     expect(config.google).toBeNull();
     expect(config.googleMissing).toEqual(['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'MAIL_TRIAGE_ENCRYPTION_KEY']);
+    expect(config).toMatchObject({ taggingMode: 'dry-run', pollIntervalMs: 120_000, autoLabelUnscored: false, confidenceThreshold: 0.7, categoriesFile: null, setupPage: true });
+  });
+
+  it('validates tagging settings', () => {
+    expect(loadConfig({ TAGGING_MODE: 'apply', POLL_INTERVAL_SECONDS: '0' })).toMatchObject({ taggingMode: 'apply', pollIntervalMs: 0 });
+    expect(() => loadConfig({ TAGGING_MODE: 'yolo' })).toThrow(/TAGGING_MODE/);
+    expect(() => loadConfig({ POLL_INTERVAL_SECONDS: '5' })).toThrow(/POLL_INTERVAL_SECONDS/);
+    expect(() => loadConfig({ CONFIDENCE_THRESHOLD: '1.5' })).toThrow(/CONFIDENCE_THRESHOLD/);
+    expect(loadConfig({ CATEGORIES_FILE: 'examples/categories.json' }).categoriesFile).toMatch(/examples\/categories\.json$/);
   });
 });
 
@@ -54,20 +63,23 @@ describe('HTTP protections', () => {
     expect(response.status).toBe(421);
   });
 
-  it('requires a session for every API operation', async () => {
+  it('requires a session for every API operation except health', async () => {
     const { app } = createHarness();
     const client = new Client(app);
-    for (const path of ['/api/status', '/api/taxonomy', '/api/mailboxes/demo/messages']) {
+    expect((await client.get('/api/health')).body).toEqual({ ok: true });
+    for (const path of ['/api/status', '/api/taxonomy']) {
       expect((await client.get(path)).status).toBe(401);
     }
-    expect((await client.post('/api/mailboxes/demo/classify', {})).status).toBe(401);
+    for (const path of ['/api/gmail/connect', '/api/gmail/disconnect', '/api/pipeline/run']) {
+      expect((await client.post(path, {})).status).toBe(401);
+    }
   });
 
   it('requires same origin and a CSRF token for state changes', async () => {
     const { app } = createHarness();
     const client = await new Client(app).signIn();
     const crossSite = await client.agent
-      .post('/api/mailboxes/demo/classify')
+      .post('/api/gmail/disconnect')
       .set('Host', 'localhost:8787')
       .set('Origin', 'https://attacker.example')
       .set('x-csrf-token', client.csrf)
@@ -75,14 +87,14 @@ describe('HTTP protections', () => {
     expect(crossSite.status).toBe(403);
     expect(crossSite.body.error.code).toBe('bad_origin');
 
-    const noToken = await client.agent.post('/api/mailboxes/demo/classify').set('Host', 'localhost:8787').set('Origin', ORIGIN).send({});
+    const noToken = await client.agent.post('/api/gmail/disconnect').set('Host', 'localhost:8787').set('Origin', ORIGIN).send({});
     expect(noToken.status).toBe(403);
     expect(noToken.body.error.code).toBe('bad_csrf');
 
-    const noOrigin = await client.agent.post('/api/mailboxes/demo/classify').set('Host', 'localhost:8787').set('x-csrf-token', client.csrf).send({});
+    const noOrigin = await client.agent.post('/api/gmail/disconnect').set('Host', 'localhost:8787').set('x-csrf-token', client.csrf).send({});
     expect(noOrigin.status).toBe(403);
 
-    expect((await client.post('/api/mailboxes/demo/classify', {})).status).toBe(200);
+    expect((await client.post('/api/gmail/disconnect', {})).status).toBe(200);
   });
 
   it('issues HttpOnly SameSite=Lax session cookies and strict security headers', async () => {

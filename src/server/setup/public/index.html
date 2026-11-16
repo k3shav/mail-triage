@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mail Triage setup</title>
+    <link rel="stylesheet" href="/setup.css">
+    <script src="/setup.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Mail Triage</h1>
+        <p class="lede">A background Gmail labeler. This page is only for setup; your labels appear in Gmail.</p>
+      </header>
+
+      <p id="notice" class="notice" role="status" hidden></p>
+
+      <section id="login" hidden>
+        <h2>Sign in</h2>
+        <form id="login-form">
+          <label for="password">App password</label>
+          <input id="password" type="password" autocomplete="current-password" required>
+          <button type="submit">Sign in</button>
+        </form>
+        <p id="login-error" class="error" role="alert" hidden></p>
+      </section>
+
+      <div id="app" hidden>
+        <section>
+          <h2>Status</h2>
+          <dl class="status">
+            <dt>Mode</dt>
+            <dd id="mode"></dd>
+            <dt>Gmail</dt>
+            <dd id="gmail"></dd>
+            <dt>Model</dt>
+            <dd id="model"></dd>
+            <dt>Background</dt>
+            <dd id="pipeline"></dd>
+            <dt>Last cycle</dt>
+            <dd id="cycle"></dd>
+            <dt>Labels</dt>
+            <dd id="labels"></dd>
+          </dl>
+          <div id="problems-box" class="problems" hidden>
+            <h3>Before labels can be added</h3>
+            <ul id="problems"></ul>
+          </div>
+          <div class="actions">
+            <button id="connect" type="button">Connect Gmail</button>
+            <button id="run" type="button" class="secondary">Run a cycle now</button>
+            <button id="refresh" type="button" class="secondary">Refresh</button>
+            <button id="disconnect" type="button" class="danger" hidden>Disconnect Gmail</button>
+            <button id="logout" type="button" class="link" hidden>Sign out</button>
+          </div>
+        </section>
+
+        <section>
+          <h2>Categories</h2>
+          <p id="categories-source"></p>
+          <form id="taxonomy-form">
+            <label for="taxonomy">Categories JSON: <code>categories</code> (each with <code>id</code>, <code>name</code>, <code>description</code>) and <code>userContext</code></label>
+            <textarea id="taxonomy" rows="18" spellcheck="false"></textarea>
+            <div class="actions">
+              <button id="save-taxonomy" type="submit">Save categories</button>
+            </div>
+          </form>
+          <p id="taxonomy-result" role="status" hidden></p>
+        </section>
+
+        <section>
+          <h2>Google OAuth client</h2>
+          <p>Create an OAuth client of type <strong>Web application</strong> in your own Google Cloud project, enable the Gmail API, and register this exact redirect URI:</p>
+          <p><code id="redirect-uri">not configured</code></p>
+          <p>Requested scopes: <span id="scopes"></span></p>
+        </section>
+      </div>
+    </main>
+  </body>
+</html>

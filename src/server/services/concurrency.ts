@@ -50,8 +50,8 @@ export interface LockOptions {
 }
 
 /**
- * Hold a SQLite-backed lease for the duration of `fn`, so the web server and
- * a cron-driven CLI never run the same job for the same account at once.
+ * Hold a SQLite-backed lease for the duration of `fn`, so the server's
+ * background cycle and a CLI run never work on the same account at once.
  * The lease is renewed while `fn` runs; if another owner takes it over, the
  * lease's signal aborts and its commits are refused. Release only removes
  * this owner's row.
@@ -61,7 +61,7 @@ export async function withLock<T>(store: Store, name: string, fn: (lease: Lease)
   const renewMs = options.renewMs ?? LOCK_RENEW_MS;
   const owner = `${process.pid}:${randomUUID()}`;
   if (!store.acquireLock(name, owner, ttlMs)) {
-    throw new AppError(409, 'busy', 'Another sync or classification run is in progress for this mailbox');
+    throw new AppError(409, 'busy', 'Another tagging cycle is running for this mailbox (another process or the server)');
   }
   const controller = new AbortController();
   const lost = () => {

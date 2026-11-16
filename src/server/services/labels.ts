@@ -1,280 +1,218 @@
-import { FIELD_LABELS, FIELD_NAMES, optionName, type FieldName, type Taxonomy } from '../../core/taxonomy.js';
-import type { AppConfig } from '../config.js';
-import { randomToken } from '../crypto.js';
-import type { Account, LabelApplyRow, Store, StoredMessage } from '../db/store.js';
-import { AppError, notFound } from '../errors.js';
-import { GmailApiError, type GmailClient } from '../gmail/client.js';
-import { canApply, effectiveDecision, type EffectiveDecision } from './decisions.js';
-import { capabilities, type GmailConnection } from './gmail-connection.js';
+import type { TaggingMode } from '../config.js';
+import { MAX_CLASSIFY_FAILURES, type Account, type Store, type TagCandidate, type TagOutcome, type TaxonomyRevision } from '../db/store.js';
+import { AppError } from '../errors.js';
+import { GmailApiError, type GmailClient, type GmailLabel } from '../gmail/client.js';
+import { LeaseLostError, type Lease } from './concurrency.js';
+import { planTags, tagPolicyKey, type TagPolicy } from './decisions.js';
+import { isFatalGmailError } from './sync.js';
 
-export const PREVIEW_TTL_MS = 10 * 60_000;
-
-export interface PlannedLabel {
-  field: FieldName;
-  name: string;
+export interface TagStats {
+  /** Candidates examined this run. */
+  considered: number;
+  /** Messages that got (or, in dry-run, would get) category, action, and priority labels. */
+  labeled: number;
+  /** Messages that got (or would get) only the Needs Review label. */
+  reviewOnly: number;
+  /** Unscored answers labeled with AUTO_LABEL_UNSCORED, plus Needs Review. */
+  labeledForReview: number;
+  /** Messages that already carried every planned label. */
+  unchanged: number;
+  /** Individual label additions made (or that would be made). */
+  labelsAdded: number;
+  /** Gmail labels created (or that would be created). */
+  labelsCreated: number;
+  failed: number;
+  /** Plans dropped because the configuration or the classification changed mid-run. */
+  superseded: number;
+  /** Messages no longer in Gmail, or whose thread no longer matches. */
+  skipped: number;
+  remaining: number;
 }
 
-/** `<prefix>/Category/Receipt`, `<prefix>/Action/Needs Action`, `<prefix>/Priority/High`. */
-export function plannedLabels(prefix: string, taxonomy: Taxonomy, decision: EffectiveDecision): PlannedLabel[] {
-  return FIELD_NAMES.map((field) => {
-    const id = decision[field];
-    const name = id ? optionName(taxonomy, field, id) : undefined;
-    if (!name) throw new AppError(409, 'decision_incomplete', `The ${field} decision is missing or no longer valid`);
-    return { field, name: `${prefix}/${FIELD_LABELS[field]}/${name}` };
-  });
+function emptyStats(): TagStats {
+  return { considered: 0, labeled: 0, reviewOnly: 0, labeledForReview: 0, unchanged: 0, labelsAdded: 0, labelsCreated: 0, failed: 0, superseded: 0, skipped: 0, remaining: 0 };
 }
 
-export interface ExistingNamespacedLabel {
-  name: string;
-  field: FieldName | null;
-  /** True when it is a different value for a field this preview also labels. */
-  conflicts: boolean;
-}
+const OUTCOME_STAT: Record<TagOutcome, 'labeled' | 'reviewOnly' | 'labeledForReview'> = {
+  labeled: 'labeled',
+  review: 'reviewOnly',
+  labeled_review: 'labeledForReview',
+};
 
-export interface LabelPreview {
-  previewId: string | null;
-  expiresAt: number | null;
-  simulated: boolean;
-  canApply: boolean;
-  blockedReason: string | null;
-  decision: EffectiveDecision;
-  labels: PlannedLabel[];
-  toAdd: string[];
-  alreadyPresent: string[];
-  existingNamespaced: ExistingNamespacedLabel[];
-  notes: string[];
-}
-
-export interface ApplyResult {
-  status: 'applied' | 'noop';
-  simulated: boolean;
-  replayed: boolean;
-  added: string[];
-  labels: string[];
-}
-
-const ADDITIVE_NOTE =
-  'Labels are only added. Mail Triage never removes labels, so earlier Mail Triage labels stay on the message until you remove them in Gmail.';
-
-export class LabelService {
+/**
+ * Adds planned labels to Gmail messages. Gmail is only ever asked to create
+ * a label under the configured prefix or to add label ids to one message;
+ * nothing is removed, archived, sent, or marked read. Dry-run reads Gmail to
+ * count what would change and records the plan locally, but never writes.
+ */
+export class Tagger {
   constructor(
-    private readonly config: AppConfig,
     private readonly store: Store,
-    private readonly connection: GmailConnection,
-    private readonly now: () => number = Date.now,
-    private readonly clientFor: (account: Account) => GmailClient = (account) => connection.client(account.id),
+    private readonly policy: TagPolicy,
+    private readonly batchSize: number,
   ) {}
 
-  private decisionFor(message: StoredMessage) {
-    const { revision, taxonomy } = this.store.currentTaxonomy();
-    const classification = this.store.latestClassifications([message.id]).get(message.id);
-    const correction = this.store.latestCorrections([message.id]).get(message.id);
-    const decision = effectiveDecision({ message, classification, correction, revision, taxonomy, policy: this.store.getReviewPolicy() });
-    return { revision, taxonomy, decision };
-  }
-
-  /** Current label names on the message. Gmail is asked fresh; demo uses local state. */
-  private async currentLabelNames(account: Account, message: StoredMessage, client: GmailClient | null): Promise<string[]> {
-    if (!client) return message.labelIds;
-    const fresh = await client.getMessageMinimal(message.externalId);
-    if (fresh.threadId !== message.threadId) throw new AppError(409, 'message_mismatch', 'Gmail message no longer matches the stored message');
-    this.store.updateMessageLabels(account.id, message.externalId, fresh.labelIds);
-    const labels = await client.listLabels();
-    this.store.replaceLabelCache(account.id, labels);
-    const names = new Map(labels.map((label) => [label.id, label.name]));
-    return fresh.labelIds.map((id) => names.get(id) ?? id);
-  }
-
-  private gmailBlockedReason(account: Account): string | null {
-    if (account.kind === 'demo') return null;
-    if (this.connection.keyMismatch(account)) return 'The encryption key changed since Gmail was connected. Reconnect Gmail.';
-    return capabilities(account, this.config).applyBlockedReason;
-  }
-
-  async preview(account: Account, messageId: number): Promise<LabelPreview> {
-    const message = this.store.getMessage(account.id, messageId);
-    if (!message) throw notFound('Message');
-    const { revision, taxonomy, decision } = this.decisionFor(message);
-    const simulated = account.kind === 'demo';
-    const notes = [ADDITIVE_NOTE];
-    if (simulated) notes.push('Demo inbox: applying records the labels locally. Nothing is sent to Gmail.');
-
-    const base = { simulated, decision, notes, toAdd: [], alreadyPresent: [], existingNamespaced: [], labels: [] };
-    if (!canApply(decision)) {
-      const reason =
-        decision.state === 'needs_review'
-          ? 'Review this classification first: accept it or correct it.'
-          : decision.state === 'stale'
-            ? 'Categories or reader context changed since this was classified. Reclassify or confirm it again.'
-            : 'Classify this message first.';
-      return { ...base, previewId: null, expiresAt: null, canApply: false, blockedReason: reason };
-    }
-
-    const labels = plannedLabels(this.config.labelPrefix, taxonomy, decision);
-    const blockedReason = this.gmailBlockedReason(account);
-    const client = simulated ? null : this.clientFor(account);
-    let existing: string[] = message.labelIds;
-    if (client && capabilities(account, this.config).canRead) existing = await this.currentLabelNames(account, message, client);
-
-    const targetNames = labels.map((label) => label.name);
-    const existingSet = new Set(existing);
-    const prefix = `${this.config.labelPrefix}/`;
-    const existingNamespaced = existing
-      .filter((name) => name.startsWith(prefix) && !targetNames.includes(name))
-      .map((name): ExistingNamespacedLabel => {
-        const segment = name.slice(prefix.length).split('/')[0];
-        const field = FIELD_NAMES.find((f) => FIELD_LABELS[f] === segment) ?? null;
-        return { name, field, conflicts: field !== null };
-      });
-    if (existingNamespaced.some((label) => label.conflicts)) {
-      notes.push('This message already has other Mail Triage labels for the same fields. They will remain alongside the new ones.');
-    }
-
-    let previewId: string | null = null;
-    let expiresAt: number | null = null;
-    if (!blockedReason) {
-      previewId = `pv_${randomToken(18)}`;
-      const createdAt = this.now();
-      expiresAt = createdAt + PREVIEW_TTL_MS;
-      this.store.insertPreview({
-        id: previewId,
-        accountId: account.id,
-        messageId: message.id,
-        externalId: message.externalId,
-        taxonomyRevision: revision,
-        decisionSeq: decision.decisionSeq,
-        decisionSource: decision.source!,
-        decisionRef: decision.sourceId!,
-        provider: decision.provider!,
-        model: decision.model!,
-        labels: targetNames,
-        createdAt,
-        expiresAt,
-      });
-    }
-    return {
-      ...base,
-      previewId,
-      expiresAt,
-      canApply: blockedReason === null,
-      blockedReason,
-      labels,
-      toAdd: targetNames.filter((name) => !existingSet.has(name)),
-      alreadyPresent: targetNames.filter((name) => existingSet.has(name)),
-      existingNamespaced,
-    };
-  }
-
-  private replay(row: LabelApplyRow, simulated: boolean, labels: string[]): ApplyResult {
-    if (row.status === 'applied' || row.status === 'noop') {
-      return { status: row.status, simulated, replayed: true, added: row.addedLabels, labels };
-    }
-    if (row.status === 'pending') throw new AppError(409, 'apply_in_progress', 'This preview is already being applied');
-    throw new AppError(409, 'preview_used', 'This preview was already used and failed. Create a new preview.');
+  get planKey(): string {
+    return tagPolicyKey(this.policy);
   }
 
   /**
-   * Apply one previewed set of labels to one message. Every binding recorded
-   * in the preview is re-checked; any change rejects the apply.
+   * True while everything a plan was built from still holds: this owner's
+   * lease (checked inside the transaction by `lease.commit`), the account,
+   * the configuration revision and hash, the message and its thread, and the
+   * classification (or the recorded classification failure).
    */
-  async apply(account: Account, previewId: string): Promise<ApplyResult> {
-    const preview = this.store.getPreview(previewId);
-    if (!preview) throw notFound('Preview');
-    if (preview.accountId !== account.id) throw new AppError(409, 'account_mismatch', 'This preview belongs to a different mailbox');
-    const simulated = account.kind === 'demo';
-
-    const prior = this.store.getApply(previewId);
-    if (prior) return this.replay(prior, simulated, preview.labels);
-    if (preview.consumedAt !== null) throw new AppError(409, 'preview_used', 'This preview was already used');
-    if (preview.expiresAt < this.now()) throw new AppError(410, 'preview_expired', 'This preview expired. Create a new preview.');
-
-    const message = this.store.getMessage(account.id, preview.messageId);
-    if (!message || message.externalId !== preview.externalId) {
-      throw new AppError(409, 'message_mismatch', 'The message for this preview no longer matches');
-    }
-    const { revision, taxonomy, decision } = this.decisionFor(message);
-    if (revision !== preview.taxonomyRevision) {
-      throw new AppError(409, 'stale_config', 'Categories or reader context changed after this preview. Create a new preview.');
-    }
-    if (message.decisionSeq !== preview.decisionSeq || decision.sourceId !== preview.decisionRef || decision.source !== preview.decisionSource) {
-      throw new AppError(409, 'stale_decision', 'The classification or correction changed after this preview. Create a new preview.');
-    }
-    if (decision.provider !== preview.provider || decision.model !== preview.model) {
-      throw new AppError(409, 'stale_decision', 'The provider or model changed after this preview. Create a new preview.');
-    }
-    if (!canApply(decision)) throw new AppError(409, 'needs_review', 'This message needs review before labels can be applied');
-    const targetNames = plannedLabels(this.config.labelPrefix, taxonomy, decision).map((label) => label.name);
-    if (JSON.stringify(targetNames) !== JSON.stringify(preview.labels)) {
-      throw new AppError(409, 'stale_decision', 'The planned labels changed after this preview. Create a new preview.');
-    }
-    const blockedReason = this.gmailBlockedReason(account);
-    if (blockedReason) throw new AppError(403, 'apply_not_permitted', blockedReason);
-
-    if (!this.store.claimPreview(previewId)) {
-      const raced = this.store.getApply(previewId);
-      if (raced) return this.replay(raced, simulated, preview.labels);
-      throw new AppError(410, 'preview_expired', 'This preview expired. Create a new preview.');
-    }
-
-    try {
-      const result = simulated ? this.applyDemo(account, message, targetNames) : await this.applyGmail(account, message, targetNames);
-      this.store.finishApply(previewId, result.status, result.added, null);
-      return { ...result, simulated, replayed: false, labels: targetNames };
-    } catch (error) {
-      const safe = error instanceof AppError || error instanceof GmailApiError ? error.message : 'Applying labels failed';
-      this.store.finishApply(previewId, 'failed', [], safe);
-      if (error instanceof AppError) throw error;
-      throw new AppError(502, 'apply_failed', safe);
-    }
+  private isCurrent(account: Account, config: TaxonomyRevision, candidate: TagCandidate): boolean {
+    const current = this.store.currentTaxonomy();
+    if (current.revision !== config.revision || current.hash !== config.hash) return false;
+    const live = this.store.getAccount(account.id);
+    if (!live || live.tokenStatus !== 'ok') return false;
+    const message = this.store.getMessage(account.id, candidate.message.id);
+    if (!message || message.externalId !== candidate.message.externalId || message.threadId !== candidate.message.threadId) return false;
+    if (message.decisionSeq !== candidate.message.decisionSeq) return false;
+    const latest = this.store.latestClassificationId(message.id, config.revision);
+    if (candidate.classification) return latest === candidate.classification.id;
+    return latest === null && message.classifyFailedRevision === config.revision && message.classifyFailures >= MAX_CLASSIFY_FAILURES;
   }
 
-  private applyDemo(account: Account, message: StoredMessage, names: string[]): { status: 'applied' | 'noop'; added: string[] } {
-    const added = names.filter((name) => !message.labelIds.includes(name));
-    if (added.length === 0) return { status: 'noop', added };
-    this.store.updateMessageLabels(account.id, message.externalId, [...message.labelIds, ...added]);
-    return { status: 'applied', added };
-  }
+  async run(options: { account: Account; client: GmailClient; lease: Lease; cancel: AbortSignal; mode: TaggingMode }): Promise<TagStats> {
+    const { account, client, lease, cancel, mode } = options;
+    const stats = emptyStats();
+    const config = this.store.currentTaxonomy();
+    const planKey = this.planKey;
+    const candidates = this.store.tagCandidates(account.id, config.revision, planKey, mode, this.batchSize);
+    // Nothing to do means no Gmail calls at all.
+    if (candidates.length === 0) return stats;
 
-  private async applyGmail(account: Account, message: StoredMessage, names: string[]): Promise<{ status: 'applied' | 'noop'; added: string[] }> {
-    const client = this.clientFor(account);
-    const fresh = await client.getMessageMinimal(message.externalId);
-    if (fresh.threadId !== message.threadId) throw new AppError(409, 'message_mismatch', 'Gmail message no longer matches the stored message');
+    let labels: Map<string, string> | null = null;
+    const labelIds = async () => {
+      labels ??= new Map((await client.listLabels()).map((label: GmailLabel) => [label.name, label.id]));
+      return labels;
+    };
+    const wouldCreate = new Set<string>();
+    const stopped = () => cancel.aborted || lease.signal.aborted;
 
-    const labelIds = await this.ensureLabels(account, client, names);
-    const missing = names.filter((name) => !fresh.labelIds.includes(labelIds.get(name)!));
-    if (missing.length === 0) {
-      this.store.updateMessageLabels(account.id, message.externalId, fresh.labelIds);
-      return { status: 'noop', added: [] };
-    }
-    const updated = await client.addLabels(
-      message.externalId,
-      missing.map((name) => labelIds.get(name)!),
-    );
-    const notApplied = missing.filter((name) => !updated.labelIds.includes(labelIds.get(name)!));
-    if (notApplied.length > 0) throw new AppError(502, 'apply_unverified', 'Gmail did not confirm every label');
-    this.store.updateMessageLabels(account.id, message.externalId, updated.labelIds);
-    return { status: 'applied', added: missing };
-  }
+    for (const candidate of candidates) {
+      if (stopped()) break;
+      stats.considered += 1;
+      const plan = planTags(candidate.classification, config.taxonomy, this.policy);
+      const record = (status: 'planned' | 'applied' | 'failed' | 'skipped', added: string[], error: string | null) =>
+        this.store.recordTag({
+          accountId: account.id,
+          messageId: candidate.message.id,
+          classificationId: candidate.classification?.id ?? null,
+          taxonomyRevision: config.revision,
+          planKey,
+          outcome: plan.outcome,
+          labels: plan.labels,
+          status,
+          added,
+          error,
+        });
+      const ifCurrent = (write?: () => void): boolean =>
+        lease.commit(() => {
+          if (!this.isCurrent(account, config, candidate)) return false;
+          write?.();
+          return true;
+        });
 
-  /** Find or create each namespaced label by exact name. */
-  private async ensureLabels(account: Account, client: GmailClient, names: string[]): Promise<Map<string, string>> {
-    let labels = await client.listLabels();
-    const byName = () => new Map(labels.map((label) => [label.name, label.id]));
-    let map = byName();
-    for (const name of names) {
-      if (map.has(name)) continue;
       try {
-        const created = await client.createLabel(name);
-        labels = [...labels, created];
+        if (!ifCurrent()) {
+          stats.superseded += 1;
+          continue;
+        }
+        const fresh = await client.getMessageMinimal(candidate.message.externalId);
+        if (fresh.threadId !== candidate.message.threadId) {
+          lease.commit(() => record('skipped', [], 'Gmail thread no longer matches the stored message'));
+          stats.skipped += 1;
+          continue;
+        }
+        const byName = await labelIds();
+        const missing = plan.labels.filter((name) => {
+          const id = byName.get(name);
+          return id === undefined || !fresh.labelIds.includes(id);
+        });
+
+        if (missing.length === 0) {
+          if (ifCurrent(() => record(mode === 'apply' ? 'applied' : 'planned', [], null))) stats.unchanged += 1;
+          else stats.superseded += 1;
+          continue;
+        }
+
+        if (mode === 'dry-run') {
+          if (!ifCurrent(() => record('planned', missing, null))) {
+            stats.superseded += 1;
+            continue;
+          }
+          for (const name of missing) if (!byName.has(name)) wouldCreate.add(name);
+          stats[OUTCOME_STAT[plan.outcome]] += 1;
+          stats.labelsAdded += missing.length;
+          continue;
+        }
+
+        // Re-check after the reads above and before any Gmail write.
+        if (!ifCurrent()) {
+          stats.superseded += 1;
+          continue;
+        }
+        const ids: string[] = [];
+        for (const name of missing) {
+          if (stopped()) throw new GmailApiError(0, 'aborted', 'Gmail request cancelled');
+          const { id, created } = await this.ensureLabel(client, byName, name);
+          if (created) stats.labelsCreated += 1;
+          ids.push(id);
+        }
+        if (stopped() || !ifCurrent()) {
+          if (stopped()) break;
+          stats.superseded += 1;
+          continue;
+        }
+        const updated = await client.addLabels(candidate.message.externalId, ids);
+        const unconfirmed = ids.filter((id) => !updated.labelIds.includes(id));
+        if (unconfirmed.length > 0) throw new GmailApiError(502, 'unverified', 'Gmail did not confirm every label');
+        // The write happened; record it even if the configuration moved on meanwhile.
+        lease.commit(() => {
+          this.store.updateMessageLabels(account.id, candidate.message.externalId, updated.labelIds);
+          record('applied', missing, null);
+        });
+        stats[OUTCOME_STAT[plan.outcome]] += 1;
+        stats.labelsAdded += missing.length;
       } catch (error) {
-        // 409: created concurrently (or by an earlier partial run); re-read.
-        if (!(error instanceof GmailApiError && error.status === 409)) throw error;
-        labels = await client.listLabels();
+        if (error instanceof LeaseLostError || lease.signal.aborted) throw new LeaseLostError();
+        if (cancel.aborted) break;
+        if (isFatalGmailError(error)) throw error;
+        if (error instanceof GmailApiError && error.status === 404) {
+          lease.commit(() => record('skipped', [], 'Message is no longer in Gmail'));
+          stats.skipped += 1;
+          continue;
+        }
+        const message = error instanceof GmailApiError || error instanceof AppError ? error.message : 'Labeling failed';
+        lease.commit(() => record('failed', [], message.slice(0, 300)));
+        stats.failed += 1;
       }
-      map = byName();
-      if (!map.has(name)) throw new AppError(502, 'label_create_failed', 'Gmail did not create a required label');
     }
-    this.store.replaceLabelCache(account.id, labels);
-    return map;
+    if (mode === 'dry-run') stats.labelsCreated = wouldCreate.size;
+    stats.remaining = this.store.tagCandidates(account.id, this.store.currentTaxonomy().revision, planKey, mode, 1000).length;
+    return stats;
+  }
+
+  /** Find a label by exact name, or create it. A concurrent creation (409) is resolved by listing again. */
+  private async ensureLabel(client: GmailClient, byName: Map<string, string>, name: string): Promise<{ id: string; created: boolean }> {
+    const existing = byName.get(name);
+    if (existing) return { id: existing, created: false };
+    try {
+      const created = await client.createLabel(name);
+      byName.set(created.name, created.id);
+      return { id: created.id, created: true };
+    } catch (error) {
+      if (!(error instanceof GmailApiError && error.status === 409)) throw error;
+      const labels = await client.listLabels();
+      for (const label of labels) byName.set(label.name, label.id);
+      // Gmail treats label names case-insensitively when checking for conflicts.
+      const match = labels.find((label) => label.name === name) ?? labels.find((label) => label.name.toLowerCase() === name.toLowerCase());
+      if (!match) throw new GmailApiError(502, 'label_create_failed', 'Gmail did not create a required label');
+      byName.set(name, match.id);
+      return { id: match.id, created: false };
+    }
   }
 }

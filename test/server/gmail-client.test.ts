@@ -3,7 +3,7 @@ import { GmailApiError, GmailClient, MAX_ERROR_BODY_BYTES, MAX_FULL_MESSAGE_BYTE
 import { BodyTooLargeError, readBoundedText } from '../../src/server/http/bounded-body.js';
 import { MAX_PARTS, extractBody, prunePartTree, type GmailPart } from '../../src/server/gmail/mime.js';
 import { parseGmailMessage } from '../../src/server/services/sync.js';
-import { Client, createHarness } from '../helpers/harness.js';
+import { connectedHarness } from '../helpers/harness.js';
 import { plainMessage } from '../helpers/fake-google.js';
 
 const CHUNK = 64 * 1024;
@@ -87,11 +87,11 @@ describe('bounded response reads', () => {
     expect(probe.pulledBytes).toBeLessThanOrEqual(MAX_ERROR_BODY_BYTES + 3 * CHUNK);
   });
 
-  it('skips only the oversized message during sync', async () => {
-    const h = createHarness();
+  it('reads an oversized message by headers only during sync, without buffering it', async () => {
+    const h = await connectedHarness();
     h.google.addMessages(
       plainMessage('m1', 'Deploy failed on main', 'Build 412 failed.'),
-      plainMessage('m2', 'Huge newsletter', 'placeholder'),
+      plainMessage('m2', 'Huge newsletter', 'Body that is never read', { snippet: 'Gmail snippet' }),
       plainMessage('m3', 'Weekly digest', 'Top stories.'),
     );
     const probes: Array<{ pulledBytes: number; cancelled: boolean }> = [];
@@ -101,16 +101,13 @@ describe('bounded response reads', () => {
       probes.push(probe);
       return response;
     };
-    const client = await new Client(h.app).signIn();
-    await client.connectGmail();
-    const sync = await client.post('/api/mailboxes/gmail/sync');
-    expect(sync.status).toBe(200);
-    expect(sync.body).toEqual({ listed: 3, added: 2, refreshed: 0, failed: 1 });
+    const result = await h.context.pipeline.runCycle({ mode: 'dry-run' });
+    expect(result.sync).toEqual({ listed: 3, added: 3, known: 0, failed: 0 });
     expect(probes).toHaveLength(1);
     expect(probes[0]!.cancelled).toBe(true);
-    expect(h.store.lastRun(h.store.getGmailAccount()!.id, 'sync')!.status).toBe('partial');
-    const subjects = (await client.get('/api/mailboxes/gmail/messages')).body.messages.map((m: { subject: string }) => m.subject);
-    expect(subjects.sort()).toEqual(['Deploy failed on main', 'Weekly digest']);
+    expect(probes[0]!.pulledBytes).toBeLessThan(MAX_FULL_MESSAGE_BYTES + 3 * CHUNK);
+    const huge = h.model.calls.find((call) => call.email.subject === 'Huge newsletter')!;
+    expect(huge.email.body).toBe('Gmail snippet');
   });
 });
 

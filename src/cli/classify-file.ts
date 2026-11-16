@@ -11,7 +11,7 @@ import { createProviderFromEnv } from '../providers/registry.js';
 import type { ClassificationOutcome } from '../core/classify.js';
 
 const USAGE = `Usage:
-  npm run classify -- --demo                     Show fixture labels for the bundled demo inbox (no model call)
+  npm run classify -- --demo                     Show hand-written fixture answers for the bundled sample emails (no model, no credentials)
   npm run classify -- <email.json> [--taxonomy <taxonomy.json>]
                                                  Classify one email with the model set by MODEL_PROVIDER
 
@@ -52,7 +52,7 @@ async function main(): Promise<number> {
 
   if (values.demo) {
     const provider = new FixtureProvider();
-    console.log('Demo fixtures: hand-written labels, not model output.\n');
+    console.log('Demo fixtures: hand-written answers for fictional sample emails, not model output. Nothing touches Gmail.\n');
     for (const demo of DEMO_MESSAGES) {
       const outcome = await classifyEmail({ provider, email: demo.email, taxonomy, policy: DEFAULT_REVIEW_POLICY, messageKey: demo.key });
       console.log(`${demo.email.subject}\n    ${summarize(taxonomy, outcome)}`);

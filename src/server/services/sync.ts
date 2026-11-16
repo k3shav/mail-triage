@@ -1,19 +1,29 @@
-import { DEMO_MESSAGES } from '../../demo/fixtures.js';
-import { DEMO_ACCOUNT_ID, type NewMessage, type Store } from '../db/store.js';
+import type { Account, NewMessage, Store } from '../db/store.js';
 import { AppError } from '../errors.js';
-import type { GmailClient, GmailFullMessage } from '../gmail/client.js';
+import { GmailApiError, type GmailClient, type GmailFullMessage } from '../gmail/client.js';
 import { decodeEntities, decodeHeaderValue, extractBody, extractSignals, header } from '../gmail/mime.js';
-import { capabilities, type GmailConnection } from './gmail-connection.js';
-import { mapLimit, withLock } from './concurrency.js';
+import { mapLimit, type Lease } from './concurrency.js';
 
 export interface SyncStats {
   listed: number;
   added: number;
-  refreshed: number;
+  /** Listed messages already stored; they are not downloaded again. */
+  known: number;
   failed: number;
 }
 
 const FETCH_CONCURRENCY = 4;
+
+/**
+ * Gmail errors that will repeat for every message: credentials, permission,
+ * or cancellation. They stop the run instead of being counted per message.
+ */
+export function isFatalGmailError(error: unknown): boolean {
+  if (error instanceof AppError) return true;
+  if (!(error instanceof GmailApiError)) return false;
+  if (error.reason === 'aborted') return true;
+  return error.status === 401 || (error.status === 403 && error.reason !== 'rateLimitExceeded' && error.reason !== 'userRateLimitExceeded');
+}
 
 export function parseGmailMessage(accountId: string, message: GmailFullMessage): NewMessage {
   const headers = message.payload.headers;
@@ -42,88 +52,49 @@ export function parseGmailMessage(accountId: string, message: GmailFullMessage):
 }
 
 /**
- * Pull the newest inbox messages (bounded) and store new ones. Existing
- * messages only get their label list refreshed. Reads never change unread
+ * Pull the newest inbox message ids (bounded) and download only the ones not
+ * stored yet. Runs inside the caller's lease. Reads never change unread
  * state: Gmail's messages.get does not mark mail as read.
  */
 export async function syncGmail(options: {
   store: Store;
-  connection: GmailConnection;
+  account: Account;
+  client: GmailClient;
   maxMessages: number;
-  client?: GmailClient;
+  lease: Lease;
 }): Promise<SyncStats> {
-  const { store, connection } = options;
-  const account = connection.account();
-  if (!account) throw new AppError(409, 'gmail_not_connected', 'Connect Gmail before syncing');
-  if (!capabilities(account, { labelWrites: false }).canRead) {
-    throw new AppError(409, 'gmail_reauth_required', 'Gmail read access is not available. Reconnect Gmail.');
-  }
-  const client = options.client ?? connection.client(account.id);
+  const { store, account, client, lease } = options;
+  const stats: SyncStats = { listed: 0, added: 0, known: 0, failed: 0 };
+  lease.assertHeld();
+  const refs = await client.listInboxMessageIds(options.maxMessages);
+  stats.listed = refs.length;
+  const known = store.existingExternalIds(account.id, refs.map((ref) => ref.id));
+  const fresh = refs.filter((ref) => !known.has(ref.id));
+  stats.known = refs.length - fresh.length;
 
-  return withLock(store, `sync:${account.id}`, async (lease) => {
-    const runId = store.startRun(account.id, 'sync');
-    const stats: SyncStats = { listed: 0, added: 0, refreshed: 0, failed: 0 };
+  let fatal: unknown = null;
+  await mapLimit(fresh, FETCH_CONCURRENCY, async (ref) => {
+    if (fatal || lease.signal.aborted) return;
     try {
-      const refs = await client.listInboxMessageIds(options.maxMessages);
-      stats.listed = refs.length;
-      const known = store.existingExternalIds(account.id, refs.map((ref) => ref.id));
-      await mapLimit(refs, FETCH_CONCURRENCY, async (ref) => {
-        lease.assertHeld();
-        try {
-          if (known.has(ref.id)) {
-            const minimal = await client.getMessageMinimal(ref.id);
-            lease.commit(() => store.updateMessageLabels(account.id, ref.id, minimal.labelIds));
-            stats.refreshed += 1;
-          } else {
-            const full = await client.getMessageFull(ref.id);
-            const parsed = parseGmailMessage(account.id, full);
-            if (lease.commit(() => store.insertMessage(parsed)) !== null) stats.added += 1;
-          }
-        } catch (error) {
-          if (error instanceof AppError) throw error;
-          stats.failed += 1;
-        }
-      });
-      store.finishRun(runId, stats.failed > 0 ? 'partial' : 'ok', { ...stats }, null);
-      return stats;
+      let full: GmailFullMessage;
+      try {
+        full = await client.getMessageFull(ref.id);
+      } catch (error) {
+        // Too large to read in full: classify from headers and snippet instead.
+        if (!(error instanceof GmailApiError && error.reason === 'too_large')) throw error;
+        full = await client.getMessageMetadata(ref.id);
+      }
+      const parsed = parseGmailMessage(account.id, full);
+      if (lease.commit(() => store.insertMessage(parsed)) !== null) stats.added += 1;
     } catch (error) {
-      store.finishRun(runId, 'failed', { ...stats }, error instanceof Error ? error.message.slice(0, 300) : 'Sync failed');
-      throw error;
+      if (isFatalGmailError(error) || lease.signal.aborted) {
+        fatal ??= error;
+        return;
+      }
+      stats.failed += 1;
     }
   });
-}
-
-/** Insert the bundled fictional inbox once; idempotent. */
-export function seedDemoInbox(store: Store): number {
-  store.ensureDemoAccount();
-  let added = 0;
-  for (const demo of DEMO_MESSAGES) {
-    const internalDate = Date.parse(demo.email.date);
-    const inserted = store.insertMessage({
-      accountId: DEMO_ACCOUNT_ID,
-      externalId: demo.key,
-      threadId: demo.threadKey,
-      from: demo.email.from,
-      to: demo.email.to,
-      cc: demo.email.cc,
-      subject: demo.email.subject,
-      sentAt: new Date(internalDate).toISOString(),
-      internalDate,
-      snippet: demo.snippet,
-      bodyText: demo.email.body,
-      bodySource: 'plain',
-      bodyTruncated: false,
-      signals: demo.email.signals,
-      labelIds: demo.unread ? ['INBOX', 'UNREAD'] : ['INBOX'],
-      unread: demo.unread,
-    });
-    if (inserted !== null) added += 1;
-  }
-  return added;
-}
-
-/** Remove demo decisions and simulated labels, then re-seed. */
-export function resetDemoInbox(store: Store): void {
-  store.deleteAccount(DEMO_ACCOUNT_ID);
-  seedDemoInbox(store);
+  if (fatal) throw fatal;
+  lease.commit(() => store.markWindow(account.id, refs.map((ref) => ref.id)));
+  return stats;
 }

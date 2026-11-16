@@ -65,6 +65,11 @@ export class FakeGoogle {
   failNext: { status: number; count: number } | null = null;
   /** Answer an authorized Gmail call with a custom response; return undefined to fall through. */
   respond: ((url: URL, method: string) => Response | undefined) | null = null;
+  /**
+   * Awaited before an authorized Gmail call is answered, to change state
+   * while a request is in flight or to stall it. Honors the request's abort signal.
+   */
+  before: ((url: URL, method: string) => Promise<void> | void) | null = null;
   private labelCounter = 0;
 
   addMessages(...messages: FakeMessage[]) {
@@ -85,6 +90,15 @@ export class FakeGoogle {
 
   modifyCalls(): FakeCall[] {
     return this.calls.filter((call) => call.url.includes('/modify'));
+  }
+
+  /** Every Gmail API call that could change the mailbox (label creation, modify). */
+  gmailWrites(): FakeCall[] {
+    return this.calls.filter((call) => call.method !== 'GET' && call.url.startsWith('https://gmail.googleapis.com'));
+  }
+
+  gmailCalls(): FakeCall[] {
+    return this.calls.filter((call) => call.url.startsWith('https://gmail.googleapis.com'));
   }
 
   private issueAccess(): string {
@@ -143,6 +157,16 @@ export class FakeGoogle {
       return this.json({ error: { code: this.failNext.status, status: 'UNAVAILABLE' } }, this.failNext.status);
     }
 
+    if (this.before) {
+      const signal = init.signal ?? undefined;
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = () => reject(signal?.reason ?? new DOMException('Aborted', 'AbortError'));
+        if (signal?.aborted) return onAbort();
+        signal?.addEventListener('abort', onAbort, { once: true });
+        Promise.resolve(this.before!(url, method)).then(resolve, reject);
+      });
+    }
+
     const custom = this.respond?.(url, method);
     if (custom) return custom;
 
@@ -172,6 +196,10 @@ export class FakeGoogle {
       }
       const format = url.searchParams.get('format');
       if (format === 'minimal') return this.json({ id: message.id, threadId: message.threadId, labelIds: message.labelIds });
+      if (format === 'metadata') {
+        const { body: _body, parts: _parts, ...headersOnly } = message.payload;
+        return this.json({ ...message, payload: headersOnly });
+      }
       return this.json(message);
     }
     if (method === 'GET' && path === '/labels') return this.json({ labels: this.labels });

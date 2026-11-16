@@ -23,11 +23,6 @@
   "include": [
     "src/**/*.ts",
     "test/**/*.ts",
-    "vitest.config.ts",
-    "vite.config.ts"
-  ],
-  "exclude": [
-    "src/web/**",
-    "test/web/**"
+    "vitest.config.ts"
   ]
 }
