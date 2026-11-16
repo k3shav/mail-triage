@@ -52,14 +52,32 @@ function errorCodeFromBody(text: string): string | undefined {
   return undefined;
 }
 
+/** Stop consuming before buffering more than the advertised byte limit. */
 async function readBounded(response: Response): Promise<string> {
   const declared = Number(response.headers.get('content-length') ?? '');
   if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+    await response.body?.cancel();
     throw new Error('response too large');
   }
-  const text = await response.text();
-  if (Buffer.byteLength(text) > MAX_RESPONSE_BYTES) throw new Error('response too large');
-  return text;
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) {
+        await reader.cancel();
+        throw new Error('response too large');
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, bytes).toString('utf8');
 }
 
 /**
@@ -129,7 +147,7 @@ export async function postJson(options: {
       }
     }
 
-    const errorText = await response.text().catch(() => '');
+    const errorText = await readBounded(response).catch(() => '');
     const code = errorCodeFromBody(errorText.slice(0, 64 * 1024));
     const suffix = code ? ` (${code})` : '';
     const status = response.status;
