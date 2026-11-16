@@ -21,6 +21,13 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      - name: Installed CLI bin runs
+        run: |
+          npm pack --pack-destination "$RUNNER_TEMP"
+          mkdir "$RUNNER_TEMP/cli" && cd "$RUNNER_TEMP/cli"
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund "$RUNNER_TEMP"/mail-triage-*.tgz
+          DATA_DIR="$RUNNER_TEMP/cli-data" ./node_modules/.bin/mail-triage --help
 
   docker:
     runs-on: ubuntu-latest

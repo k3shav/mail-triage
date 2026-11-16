@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { categoryTone, initials, parseAddress } from '../src/web/format.js';
+import { categoryTone, initials, parseAddress } from '../../src/web/format.js';
 
 describe('web formatting helpers', () => {
   it('parses display names and bare addresses', () => {

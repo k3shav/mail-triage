@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ApiError, api } from '../api';
 import {
   ACTIONS,
@@ -15,20 +15,23 @@ import {
   categoryTone,
   toneOf,
 } from '../format';
-import type { ApplyResult, ClassificationRecord, FieldDecision, FieldName, LabelPreview, MailboxName, MessageDetail, Status, Taxonomy } from '../types';
+import type { ApplyResult, DetailOrigin, ClassificationRecord, FieldDecision, FieldName, LabelPreview, MailboxName, MessageDetail, Status, Taxonomy } from '../types';
 import type { Toast } from './Toasts';
 import { IconAlert, IconBack, IconCheck, IconEdit, IconInfo, IconSparkle, IconTag } from './Icons';
 import { StateBadge } from './MessageList';
 
 interface Props {
   mailbox: MailboxName;
+  /** Identity of `detail`; mutation results are reported against it. */
+  origin: DetailOrigin | null;
   detail: MessageDetail | null;
   selectedId: number | null;
   taxonomy: Taxonomy | null;
   status: Status | null;
   notify: (kind: Toast['kind'], text: string) => void;
   onError: (error: unknown) => void;
-  onChanged: (detail?: MessageDetail) => Promise<void>;
+  /** The parent applies `detail` only if `origin` is still the selected message. */
+  onChanged: (origin?: DetailOrigin, detail?: MessageDetail) => Promise<void>;
   onBack: () => void;
 }
 
@@ -148,43 +151,79 @@ function CorrectionForm({
   );
 }
 
-function LabelPanel({ mailbox, detail, notify, onError, onChanged }: Pick<Props, 'mailbox' | 'notify' | 'onError' | 'onChanged'> & { detail: MessageDetail }) {
-  const [preview, setPreview] = useState<LabelPreview | null>(null);
+/** A preview belongs to one message and one decision; it is never shown or applied for anything else. */
+interface PreviewOrigin extends DetailOrigin {
+  decisionSeq: number;
+  taxonomyRevision: number;
+}
+
+function sameOrigin(a: PreviewOrigin, b: PreviewOrigin) {
+  return (
+    a.mailbox === b.mailbox &&
+    a.id === b.id &&
+    a.generation === b.generation &&
+    a.decisionSeq === b.decisionSeq &&
+    a.taxonomyRevision === b.taxonomyRevision
+  );
+}
+
+function LabelPanel({
+  mailbox,
+  origin: detailOrigin,
+  detail,
+  notify,
+  onError,
+  onChanged,
+}: Pick<Props, 'mailbox' | 'notify' | 'onError' | 'onChanged'> & { origin: DetailOrigin; detail: MessageDetail }) {
+  const origin: PreviewOrigin = {
+    ...detailOrigin,
+    decisionSeq: detail.decision.decisionSeq,
+    taxonomyRevision: detail.decision.taxonomyRevision,
+  };
+  const [stored, setStored] = useState<{ origin: PreviewOrigin; preview: LabelPreview } | null>(null);
   const [result, setResult] = useState<ApplyResult | null>(null);
   const [pending, setPending] = useState<'preview' | 'apply' | null>(null);
+  // Bumped on every request and on unmount; only the latest request may write state.
+  const requestId = useRef(0);
+  useEffect(() => () => void (requestId.current += 1), []);
 
-  // A new decision (or another message) invalidates what was previewed.
-  const decisionKey = `${detail.id}:${JSON.stringify(detail.decision)}`;
-  useEffect(() => {
-    setPreview(null);
-    setResult(null);
-  }, [decisionKey]);
+  const preview = stored && sameOrigin(stored.origin, origin) && stored.origin.id === detail.id ? stored.preview : null;
 
   const loadPreview = async () => {
+    const id = ++requestId.current;
+    const requested = origin;
     setPending('preview');
     setResult(null);
+    setStored(null);
     try {
-      setPreview(await api.preview(mailbox, detail.id));
+      const next = await api.preview(requested.mailbox, requested.id);
+      if (id === requestId.current) setStored({ origin: requested, preview: next });
     } catch (error) {
-      onError(error);
+      if (id === requestId.current) onError(error);
     } finally {
-      setPending(null);
+      if (id === requestId.current) setPending(null);
     }
   };
 
   const apply = async () => {
-    if (!preview?.previewId) return;
+    // Re-check identity at click time: the preview must belong to the message on screen.
+    if (!stored || !preview?.previewId || !sameOrigin(stored.origin, origin)) return;
+    const id = ++requestId.current;
+    const target = stored.origin;
     setPending('apply');
     try {
-      const applied = await api.apply(mailbox, preview.previewId);
+      const applied = await api.apply(target.mailbox, preview.previewId);
       notify('success', applied.status === 'noop' ? 'Those labels were already on the message.' : `Added ${applied.added.length} label${applied.added.length === 1 ? '' : 's'}${applied.simulated ? ' (simulated)' : ''}.`);
-      await onChanged(await api.message(mailbox, detail.id));
-      setResult(applied);
+      if (id === requestId.current) {
+        setResult(applied);
+        setStored(null);
+      }
+      await onChanged(target, await api.message(target.mailbox, target.id));
     } catch (error) {
       onError(error);
-      setPreview(null);
+      if (id === requestId.current) setStored(null);
     } finally {
-      setPending(null);
+      if (id === requestId.current) setPending(null);
     }
   };
 
@@ -310,7 +349,7 @@ function History({ detail, taxonomy }: { detail: MessageDetail; taxonomy: Taxono
 }
 
 export function MessageDetailView(props: Props) {
-  const { mailbox, detail, selectedId, taxonomy, status } = props;
+  const { mailbox, origin, detail, selectedId, taxonomy, status } = props;
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState<'correct' | 'reclassify' | null>(null);
 
@@ -326,7 +365,7 @@ export function MessageDetailView(props: Props) {
       </section>
     );
   }
-  if (!detail) {
+  if (!detail || !origin || detail.id !== selectedId) {
     return (
       <section className="detail-pane detail-empty">
         <span className="spinner" aria-label="Loading" />
@@ -351,16 +390,16 @@ export function MessageDetailView(props: Props) {
     try {
       const next =
         kind === 'accept' && modelSourceId !== null
-          ? await api.correct(mailbox, detail.id, { kind: 'accept', ...reviewed, basedOnClassificationId: modelSourceId })
-          : await api.correct(mailbox, detail.id, { kind: 'edit', ...reviewed, ...values, basedOnClassificationId: modelSourceId });
+          ? await api.correct(origin.mailbox, origin.id, { kind: 'accept', ...reviewed, basedOnClassificationId: modelSourceId })
+          : await api.correct(origin.mailbox, origin.id, { kind: 'edit', ...reviewed, ...values, basedOnClassificationId: modelSourceId });
       setEditing(false);
       props.notify('success', kind === 'accept' ? 'Classification accepted.' : 'Correction saved.');
-      await props.onChanged(next);
+      await props.onChanged(origin, next);
     } catch (error) {
       if (error instanceof ApiError && (error.code === 'stale_decision' || error.code === 'stale_revision')) {
         props.notify('error', `${error.message} Showing the latest decision; review it again.`);
         setEditing(false);
-        await props.onChanged(await api.message(mailbox, detail.id));
+        await props.onChanged(origin, await api.message(origin.mailbox, origin.id));
       } else props.onError(error);
     } finally {
       setSaving(null);
@@ -370,10 +409,10 @@ export function MessageDetailView(props: Props) {
   const reclassify = async () => {
     setSaving('reclassify');
     try {
-      const { outcome, ...next } = await api.reclassify(mailbox, detail.id);
+      const { outcome, ...next } = await api.reclassify(origin.mailbox, origin.id);
       if (outcome === 'superseded') props.notify('info', 'The decision changed while the model was working, so its answer was discarded.');
-      else props.notify('success', mailbox === 'demo' ? 'Fixture labels applied.' : 'Message reclassified.');
-      await props.onChanged(next);
+      else props.notify('success', origin.mailbox === 'demo' ? 'Fixture labels applied.' : 'Message reclassified.');
+      await props.onChanged(origin, next);
     } catch (error) {
       props.onError(error);
     } finally {
@@ -488,7 +527,12 @@ export function MessageDetailView(props: Props) {
           )}
         </section>
 
-        <LabelPanel mailbox={mailbox} detail={detail} notify={props.notify} onError={props.onError} onChanged={props.onChanged} />
+        <LabelPanel
+          key={`${origin.generation}:${origin.mailbox}:${origin.id}:${decision.taxonomyRevision}:${decision.decisionSeq}`}
+          mailbox={mailbox}
+          origin={origin}
+          detail={detail}
+          notify={props.notify} onError={props.onError} onChanged={props.onChanged} />
 
         <section className="card body-card">
           <div className="card-head">

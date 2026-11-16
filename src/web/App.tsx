@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiError, api, setCsrfToken } from './api';
+import { ApiError, MAX_PAGE_SIZE, api, setCsrfToken } from './api';
 import { DemoBanner, GmailOnboarding } from './components/Banners';
 import { Login } from './components/Login';
 import { MessageDetailView } from './components/MessageDetail';
@@ -8,7 +8,7 @@ import { Settings } from './components/Settings';
 import { Sidebar } from './components/Sidebar';
 import { Toasts, type Toast } from './components/Toasts';
 import { TopBar } from './components/TopBar';
-import type { Filters, MailboxName, MessageDetail, MessageList, Session, Status, TaxonomyRevision } from './types';
+import type { DetailOrigin, Filters, MailboxName, MessageDetail, MessageList, MessageSummary, Session, Status, TaxonomyRevision } from './types';
 
 const EMPTY_FILTERS: Filters = { state: '', category: '', action: '', unread: '', q: '' };
 const PAGE_SIZE = 50;
@@ -44,16 +44,33 @@ export function App() {
   const [mailbox, setMailbox] = useState<MailboxName>('demo');
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const [list, setList] = useState<MessageList | null>(null);
-  const [limit, setLimit] = useState(PAGE_SIZE);
   const [listLoading, setListLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [detail, setDetail] = useState<MessageDetail | null>(null);
+  const [detail, setDetail] = useState<{ origin: DetailOrigin; data: MessageDetail } | null>(null);
   const [view, setView] = useState<'inbox' | 'settings'>('inbox');
   const [busy, setBusy] = useState<'sync' | 'classify' | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastId = useRef(0);
-  const listRequest = useRef(0);
+
+  // Async results are applied only if they still belong to what is on screen.
+  // These refs change synchronously with user actions, before React re-renders.
+  const sessionGeneration = useRef(0);
+  const selection = useRef<{ mailbox: MailboxName; id: number | null }>({ mailbox: 'demo', id: null });
+  const listGeneration = useRef(0);
+  const loadedCount = useRef(PAGE_SIZE);
+
+  const isCurrent = useCallback(
+    (origin: DetailOrigin) =>
+      origin.generation === sessionGeneration.current && selection.current.mailbox === origin.mailbox && selection.current.id === origin.id,
+    [],
+  );
+
+  const select = useCallback((nextMailbox: MailboxName, id: number | null) => {
+    selection.current = { mailbox: nextMailbox, id };
+    setMailbox(nextMailbox);
+    setSelectedId(id);
+  }, []);
 
   const notify = useCallback((kind: Toast['kind'], text: string) => {
     toastId.current += 1;
@@ -62,11 +79,33 @@ export function App() {
     window.setTimeout(() => setToasts((current) => current.filter((t) => t.id !== id)), kind === 'error' ? 9000 : 5000);
   }, []);
 
+  const endSession = useCallback((next: SessionState) => {
+    sessionGeneration.current += 1;
+    listGeneration.current += 1;
+    setCsrfToken(null);
+    setDetail(null);
+    setList(null);
+    setSession(next);
+  }, []);
+
+  const startSession = useCallback((current: Session) => {
+    sessionGeneration.current += 1;
+    listGeneration.current += 1;
+    setCsrfToken(current.csrfToken);
+    setSession({ phase: 'ready', mode: current.mode });
+  }, []);
+
   const handleError = useCallback(
     (error: unknown) => {
       if (error instanceof ApiError && error.status === 401) {
+        setSession((current) => {
+          const mode = current.phase === 'ready' ? current.mode : 'password';
+          return current.phase === 'login' ? current : { phase: 'login', mode };
+        });
+        sessionGeneration.current += 1;
+        listGeneration.current += 1;
         setCsrfToken(null);
-        setSession((current) => ({ phase: 'login', mode: current.phase === 'ready' ? current.mode : 'password' }));
+        setDetail(null);
         return;
       }
       notify('error', error instanceof Error ? error.message : 'Something went wrong');
@@ -78,29 +117,27 @@ export function App() {
     try {
       let current = await api.session();
       if (!current.authenticated && current.mode === 'local') current = await api.localSession();
-      if (current.authenticated) {
-        setCsrfToken(current.csrfToken);
-        setSession({ phase: 'ready', mode: current.mode });
-      } else {
-        setSession({ phase: 'login', mode: current.mode });
-      }
+      if (current.authenticated) startSession(current);
+      else endSession({ phase: 'login', mode: current.mode });
     } catch (error) {
-      setSession({ phase: 'error', message: error instanceof Error ? error.message : 'Could not reach the server' });
+      endSession({ phase: 'error', message: error instanceof Error ? error.message : 'Could not reach the server' });
     }
-  }, []);
+  }, [startSession, endSession]);
 
   useEffect(() => {
     void establish();
   }, [establish]);
 
   const refreshStatus = useCallback(async () => {
+    const generation = sessionGeneration.current;
     try {
       const [nextStatus, nextTaxonomy] = await Promise.all([api.status(), api.taxonomy()]);
+      if (generation !== sessionGeneration.current) return null;
       setStatus(nextStatus);
       setTaxonomy(nextTaxonomy);
       return nextStatus;
     } catch (error) {
-      handleError(error);
+      if (generation === sessionGeneration.current) handleError(error);
       return null;
     }
   }, [handleError]);
@@ -108,16 +145,13 @@ export function App() {
   // First load after sign-in: pick the mailbox and surface OAuth results.
   useEffect(() => {
     if (session.phase !== 'ready') return;
+    const generation = sessionGeneration.current;
     void (async () => {
       const loaded = await refreshStatus();
-      if (!loaded) return;
+      if (!loaded || generation !== sessionGeneration.current) return;
       const linked = readHash();
-      if (linked && (linked.mailbox === 'gmail' || loaded.demo.enabled)) {
-        setMailbox(linked.mailbox);
-        setSelectedId(linked.id);
-      } else {
-        setMailbox(loaded.gmail.account ? 'gmail' : loaded.demo.enabled ? 'demo' : 'gmail');
-      }
+      if (linked && (linked.mailbox === 'gmail' || loaded.demo.enabled)) select(linked.mailbox, linked.id);
+      else select(loaded.gmail.account ? 'gmail' : loaded.demo.enabled ? 'demo' : 'gmail', null);
       const params = new URLSearchParams(window.location.search);
       const outcome = params.get('gmail');
       if (outcome) {
@@ -126,52 +160,109 @@ export function App() {
         window.history.replaceState(null, '', window.location.pathname + window.location.hash);
       }
     })();
-  }, [session.phase, refreshStatus, notify]);
+  }, [session.phase, refreshStatus, notify, select]);
 
   const gmailConnected = Boolean(status?.gmail.account);
   const mailboxAvailable = mailbox === 'demo' ? Boolean(status?.demo.enabled) : gmailConnected;
+  const ready = session.phase === 'ready' && mailboxAvailable;
 
-  const loadList = useCallback(async () => {
-    if (session.phase !== 'ready' || !mailboxAvailable) {
-      setList(null);
-      return;
-    }
-    const requestId = ++listRequest.current;
-    setListLoading(true);
-    try {
-      const next = await api.messages(mailbox, filters, limit);
-      if (requestId === listRequest.current) {
-        setList(next);
-        setListError(null);
+  /**
+   * (Re)load the first `count` messages of the current query in pages of at
+   * most MAX_PAGE_SIZE. A newer load, query change, or session change makes
+   * this one's result obsolete.
+   */
+  const loadList = useCallback(
+    async (count: number) => {
+      const generation = ++listGeneration.current;
+      if (!ready) {
+        setList(null);
+        return;
       }
-    } catch (error) {
-      if (requestId === listRequest.current) setListError(error instanceof Error ? error.message : 'Could not load messages');
-      if (error instanceof ApiError && error.status === 401) handleError(error);
-    } finally {
-      if (requestId === listRequest.current) setListLoading(false);
-    }
-  }, [session.phase, mailboxAvailable, mailbox, filters, limit, handleError]);
+      setListLoading(true);
+      try {
+        let merged: MessageList | null = null;
+        const seen = new Set<number>();
+        for (let offset = 0; offset < count; offset += MAX_PAGE_SIZE) {
+          const limit = Math.min(MAX_PAGE_SIZE, count - offset);
+          const page: MessageList = await api.messages(mailbox, filters, { limit, offset });
+          if (generation !== listGeneration.current) return;
+          const messages: MessageSummary[] = merged ? merged.messages : [];
+          for (const message of page.messages) {
+            if (seen.has(message.id)) continue;
+            seen.add(message.id);
+            messages.push(message);
+          }
+          merged = { ...page, messages };
+          if (page.messages.length < limit || offset + limit >= page.total) break;
+        }
+        setList(merged);
+        setListError(null);
+      } catch (error) {
+        if (generation !== listGeneration.current) return;
+        setListError(error instanceof Error ? error.message : 'Could not load messages');
+        if (error instanceof ApiError && error.status === 401) handleError(error);
+      } finally {
+        if (generation === listGeneration.current) setListLoading(false);
+      }
+    },
+    [ready, mailbox, filters, handleError],
+  );
 
+  // A new query starts again from the first page and drops any in-flight page.
   useEffect(() => {
-    const timer = window.setTimeout(() => void loadList(), filters.q ? 200 : 0);
+    loadedCount.current = PAGE_SIZE;
+    listGeneration.current += 1;
+    setList(null);
+    const timer = window.setTimeout(() => void loadList(PAGE_SIZE), filters.q ? 200 : 0);
     return () => window.clearTimeout(timer);
   }, [loadList, filters.q]);
 
+  /** Append the next page (offset = rows already shown) to the current query's list. */
+  const loadMore = useCallback(async () => {
+    if (!list || !ready) return;
+    const generation = listGeneration.current;
+    setListLoading(true);
+    try {
+      const page = await api.messages(mailbox, filters, { limit: PAGE_SIZE, offset: list.messages.length });
+      if (generation !== listGeneration.current) return;
+      setList((current) => {
+        if (!current) return current;
+        const seen = new Set(current.messages.map((m) => m.id));
+        const messages = [...current.messages, ...page.messages.filter((m) => !seen.has(m.id))];
+        loadedCount.current = Math.max(PAGE_SIZE, messages.length);
+        return { ...page, messages };
+      });
+    } catch (error) {
+      if (generation === listGeneration.current) handleError(error);
+    } finally {
+      if (generation === listGeneration.current) setListLoading(false);
+    }
+  }, [list, ready, mailbox, filters, handleError]);
+
+  const refreshList = useCallback(() => loadList(loadedCount.current), [loadList]);
+
   const loadDetail = useCallback(
-    async (id: number) => {
+    async (origin: DetailOrigin) => {
       try {
-        setDetail(await api.message(mailbox, id));
+        const data = await api.message(origin.mailbox, origin.id);
+        if (isCurrent(origin)) setDetail({ origin, data });
       } catch (error) {
+        if (!isCurrent(origin)) return;
         handleError(error);
+        // A stale deep link or a message removed by a reset: go back to the list.
+        if (error instanceof ApiError && error.status === 404) select(origin.mailbox, null);
       }
     },
-    [mailbox, handleError],
+    [handleError, isCurrent, select],
   );
 
   useEffect(() => {
+    selection.current = { mailbox, id: selectedId };
     setDetail(null);
-    if (selectedId !== null) void loadDetail(selectedId);
-  }, [selectedId, loadDetail]);
+    if (selectedId !== null && session.phase === 'ready') {
+      void loadDetail({ mailbox, id: selectedId, generation: sessionGeneration.current });
+    }
+  }, [mailbox, selectedId, session.phase, loadDetail]);
 
   useEffect(() => {
     if (session.phase !== 'ready' || !status) return;
@@ -180,20 +271,27 @@ export function App() {
   }, [session.phase, status, mailbox, selectedId]);
 
   const switchMailbox = (next: MailboxName) => {
-    setMailbox(next);
+    select(next, null);
     setFilters(EMPTY_FILTERS);
-    setSelectedId(null);
-    setLimit(PAGE_SIZE);
     setView('inbox');
   };
 
+  /**
+   * After a mutation: show `next` only if it is the result for the message
+   * still selected, then refresh the list and status.
+   */
   const afterChange = useCallback(
-    async (next?: MessageDetail) => {
-      if (next) setDetail(next);
-      await Promise.all([loadList(), refreshStatus()]);
+    async (origin?: DetailOrigin, next?: MessageDetail) => {
+      if (origin && next && isCurrent(origin)) setDetail({ origin, data: next });
+      await Promise.all([refreshList(), refreshStatus()]);
     },
-    [loadList, refreshStatus],
+    [refreshList, refreshStatus, isCurrent],
   );
+
+  const reloadSelected = useCallback(async () => {
+    const { mailbox: m, id } = selection.current;
+    if (id !== null) await loadDetail({ mailbox: m, id, generation: sessionGeneration.current });
+  }, [loadDetail]);
 
   const runSync = async () => {
     setBusy('sync');
@@ -222,7 +320,7 @@ export function App() {
           `Classified ${stats.classified} of ${stats.attempted}; ${stats.needsReview} need review${stats.failed ? `, ${stats.failed} failed` : ''}${stats.superseded ? `, ${stats.superseded} superseded by your edits` : ''}${stats.stoppedEarly ? ' (stopped early)' : ''}.${stats.remaining ? ` ${stats.remaining} still pending.` : ''}`,
         );
       await afterChange();
-      if (selectedId !== null) await loadDetail(selectedId);
+      await reloadSelected();
     } catch (error) {
       handleError(error);
     } finally {
@@ -236,13 +334,17 @@ export function App() {
     } catch {
       // Session may already be gone.
     }
-    setCsrfToken(null);
     setStatus(null);
-    setList(null);
-    setSelectedId(null);
-    if (session.phase === 'ready' && session.mode === 'local') await establish();
-    else setSession({ phase: 'login', mode: 'password' });
+    select(mailbox, null);
+    // Do not reopen the previous message from the deep link after signing back in.
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${mailbox}`);
+    if (session.phase === 'ready' && session.mode === 'local') {
+      endSession({ phase: 'loading' });
+      await establish();
+    } else endSession({ phase: 'login', mode: 'password' });
   };
+
+  const visibleDetail = detail && isCurrent(detail.origin) ? detail : null;
 
   const originMismatch = useMemo(
     () => status !== null && status.gmail.configured && window.location.origin !== status.publicUrl && !import.meta.env.DEV,
@@ -263,10 +365,7 @@ export function App() {
   if (session.phase === 'login') {
     return (
       <Login
-        onSignedIn={(next) => {
-          setCsrfToken(next.csrfToken);
-          setSession({ phase: 'ready', mode: next.mode });
-        }}
+        onSignedIn={startSession}
       />
     );
   }
@@ -295,7 +394,7 @@ export function App() {
           onReset={async () => {
             try {
               await api.resetDemo();
-              setSelectedId(null);
+              select('demo', null);
               notify('info', 'Demo inbox restored.');
               await afterChange();
             } catch (error) {
@@ -322,7 +421,7 @@ export function App() {
             <GmailOnboarding status={status} onOpenSettings={() => setView('settings')} onError={handleError} />
           ) : (
             <>
-              <Sidebar counts={list?.counts ?? null} filters={filters} taxonomy={taxonomy?.taxonomy ?? null} onFilters={(next) => { setFilters(next); setLimit(PAGE_SIZE); }} />
+              <Sidebar counts={list?.counts ?? null} filters={filters} taxonomy={taxonomy?.taxonomy ?? null} onFilters={setFilters} />
               <MessageListView
                 list={list}
                 loading={listLoading}
@@ -330,23 +429,25 @@ export function App() {
                 filters={filters}
                 taxonomy={taxonomy?.taxonomy ?? null}
                 selectedId={selectedId}
-                onSelect={setSelectedId}
+                onSelect={(id) => select(mailbox, id)}
                 onSearch={(q) => setFilters({ ...filters, q })}
-                onLoadMore={() => setLimit(limit + PAGE_SIZE)}
+                onLoadMore={() => void loadMore()}
                 onClassify={runClassify}
                 classifying={busy === 'classify'}
                 mailbox={mailbox}
               />
               <MessageDetailView
+                key={`${mailbox}:${selectedId ?? ''}`}
                 mailbox={mailbox}
-                detail={detail}
+                origin={visibleDetail?.origin ?? null}
+                detail={visibleDetail?.data ?? null}
                 selectedId={selectedId}
                 taxonomy={taxonomy?.taxonomy ?? null}
                 status={status}
                 notify={notify}
                 onError={handleError}
                 onChanged={afterChange}
-                onBack={() => setSelectedId(null)}
+                onBack={() => select(mailbox, null)}
               />
             </>
           )}

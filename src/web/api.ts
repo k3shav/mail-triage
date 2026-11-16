@@ -26,6 +26,9 @@ export class ApiError extends Error {
   }
 }
 
+/** Mirrors the server's ListQuerySchema limit cap. */
+export const MAX_PAGE_SIZE = 100;
+
 let csrfToken: string | null = null;
 
 export function setCsrfToken(token: string | null) {
@@ -79,8 +82,9 @@ export const api = {
   connectGmail: () => call<{ url: string }>('POST', '/gmail/connect'),
   disconnectGmail: () => call<{ revoked: boolean }>('POST', '/gmail/disconnect'),
 
-  messages: (mailbox: MailboxName, filters: Filters, limit: number) => {
-    const params = new URLSearchParams({ limit: String(limit) });
+  /** One page; the server caps `limit` at MAX_PAGE_SIZE. */
+  messages: (mailbox: MailboxName, filters: Filters, page: { limit: number; offset: number }) => {
+    const params = new URLSearchParams({ limit: String(Math.min(page.limit, MAX_PAGE_SIZE)), offset: String(page.offset) });
     for (const [key, value] of Object.entries(filters)) if (value) params.set(key, value);
     return call<MessageList>('GET', `${mailboxPath(mailbox)}/messages?${params}`);
   },

@@ -60,21 +60,34 @@ function validate(draft: DraftCategory[], context: string): string[] {
 
 function CategoryEditor({ taxonomy, notify, onError, onChanged }: Pick<Props, 'taxonomy' | 'notify' | 'onError' | 'onChanged'>) {
   const toDraft = (t: Taxonomy): DraftCategory[] => t.categories.map((c) => ({ ...c, isNew: false, key: c.id }));
+  // The revision the draft was started from. Saves send it as expectedRevision.
+  const [base, setBase] = useState<TaxonomyRevision>(taxonomy);
   const [draft, setDraft] = useState<DraftCategory[]>(() => toDraft(taxonomy.taxonomy));
   const [context, setContext] = useState(taxonomy.taxonomy.userContext);
   const [saving, setSaving] = useState(false);
-  const [revision, setRevision] = useState(taxonomy.revision);
+  // A newer server revision that arrived while the draft had unsaved edits.
+  const [conflict, setConflict] = useState<TaxonomyRevision | null>(null);
 
+  const dirty =
+    context !== base.taxonomy.userContext ||
+    JSON.stringify(draft.map(({ id, name, description }) => ({ id, name, description }))) !== JSON.stringify(base.taxonomy.categories);
+
+  const reset = (next: TaxonomyRevision) => {
+    setBase(next);
+    setDraft(toDraft(next.taxonomy));
+    setContext(next.taxonomy.userContext);
+    setConflict(null);
+  };
+
+  // Status refreshes hand us a fresh object even when nothing changed. Only a
+  // different revision matters, and it never silently replaces unsaved edits.
   useEffect(() => {
-    setDraft(toDraft(taxonomy.taxonomy));
-    setContext(taxonomy.taxonomy.userContext);
-    setRevision(taxonomy.revision);
-  }, [taxonomy]);
+    if (taxonomy.revision === base.revision) return;
+    if (dirty) setConflict(taxonomy);
+    else reset(taxonomy);
+  }, [taxonomy.revision]);
 
   const problems = useMemo(() => validate(draft, context), [draft, context]);
-  const dirty =
-    context !== taxonomy.taxonomy.userContext ||
-    JSON.stringify(draft.map(({ id, name, description }) => ({ id, name, description }))) !== JSON.stringify(taxonomy.taxonomy.categories);
 
   const update = (key: string, patch: Partial<DraftCategory>) => setDraft(draft.map((c) => (c.key === key ? { ...c, ...patch } : c)));
   const move = (index: number, delta: number) => {
@@ -94,7 +107,8 @@ function CategoryEditor({ taxonomy, notify, onError, onChanged }: Pick<Props, 't
       return { id, name: c.name.trim(), description: c.description.trim() };
     });
     try {
-      const saved = await api.saveTaxonomy(revision, { categories, userContext: context.trim() });
+      const saved = await api.saveTaxonomy(base.revision, { categories, userContext: context.trim() });
+      reset(saved);
       notify(
         saved.changed ? 'success' : 'info',
         saved.changed ? `Saved as configuration revision ${saved.revision}. Earlier decisions are now stale; reclassify or confirm them.` : 'No changes to save.',
@@ -102,8 +116,11 @@ function CategoryEditor({ taxonomy, notify, onError, onChanged }: Pick<Props, 't
       await onChanged();
     } catch (error) {
       if (error instanceof ApiError && error.code === 'stale_revision') {
-        notify('error', 'The configuration was changed elsewhere. Reloaded the latest version; re-apply your edits.');
-        await onChanged();
+        try {
+          setConflict(await api.taxonomy());
+        } catch (loadError) {
+          onError(loadError);
+        }
       } else onError(error);
     } finally {
       setSaving(false);
@@ -119,6 +136,30 @@ function CategoryEditor({ taxonomy, notify, onError, onChanged }: Pick<Props, 't
           priority (Low, Normal, High) are asked separately and are not editable here.
         </p>
       </div>
+
+      {conflict ? (
+        <div className="notice notice-warn" role="alert">
+          <IconAlert />
+          <div>
+            <strong>Categories were changed elsewhere (now revision {conflict.revision}).</strong>
+            <span className="small"> Your unsaved edits are based on revision {base.revision}.</span>
+            <div className="form-actions">
+              <button className="btn btn-small" onClick={() => reset(conflict)}>
+                Discard my edits and load revision {conflict.revision}
+              </button>
+              <button
+                className="btn btn-small"
+                onClick={() => {
+                  setBase(conflict);
+                  setConflict(null);
+                }}
+              >
+                Keep my edits and save over it
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       <label className="field">
         <span>About you (reader context)</span>
@@ -187,12 +228,12 @@ function CategoryEditor({ taxonomy, notify, onError, onChanged }: Pick<Props, 't
 
       <div className="sticky-actions">
         <span className="muted small">
-          Revision {taxonomy.revision}. Saving creates a new revision; existing decisions stop being applicable until reclassified or confirmed.
+          Revision {base.revision}. Saving creates a new revision; existing decisions stop being applicable until reclassified or confirmed.
         </span>
-        <button className="btn btn-ghost" disabled={!dirty || saving} onClick={() => { setDraft(toDraft(taxonomy.taxonomy)); setContext(taxonomy.taxonomy.userContext); }}>
+        <button className="btn btn-ghost" disabled={!dirty || saving} onClick={() => reset(conflict ?? taxonomy)}>
           Discard
         </button>
-        <button className="btn btn-primary" disabled={!dirty || problems.length > 0 || saving} onClick={() => void save()}>
+        <button className="btn btn-primary" disabled={!dirty || problems.length > 0 || saving || conflict !== null} onClick={() => void save()}>
           {saving ? 'Saving…' : 'Save categories'}
         </button>
       </div>

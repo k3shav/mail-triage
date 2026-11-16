@@ -105,6 +105,8 @@ npm run cli -- sync
 npm run cli -- classify   # or: classify --demo, classify --limit 10
 ```
 
+The package also exposes a `mail-triage` executable (`dist/node/cli/index.js`, with a Node shebang). After `npm run build`, `npm link` puts it on your `PATH`. The executable does not load `.env` by itself, so export the variables first or use `npm run cli`.
+
 Example crontab entry (every 15 minutes):
 
 ```cron
@@ -175,7 +177,7 @@ Label previews: `POST …/messages/:id/label-preview`, then `POST …/apply` wit
 ```sh
 npm run dev        # API on :8787 (tsx watch) + Vite on http://localhost:5173 with /api proxied
 npm run typecheck  # server, tests, and web
-npm test           # Vitest; no network access, Google and model providers are faked
+npm test           # Vitest; no network: Google, model providers, and the UI's API calls are faked
 npm run build      # dist/node (server, CLI) and dist/web (UI)
 ```
 
@@ -189,7 +191,7 @@ src/providers   Jev, OpenAI Decisions, OpenAI-compatible, demo fixtures
 src/server      config, SQLite store, Gmail OAuth/client/MIME, services, HTTP
 src/cli         CLI and single-email classifier
 src/web         React UI
-test            unit, contract, and HTTP tests
+test            unit, contract, and HTTP tests; test/web renders the React UI in jsdom
 ```
 
 ## Configuration reference

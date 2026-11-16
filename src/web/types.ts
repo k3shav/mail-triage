@@ -233,3 +233,11 @@ export interface Filters {
   unread: '' | 'true';
   q: string;
 }
+
+/** Which message a request or result belongs to; results for a non-current origin are dropped. */
+export interface DetailOrigin {
+  mailbox: MailboxName;
+  id: number;
+  /** Session generation; bumps on sign-in, sign-out, and expired sessions. */
+  generation: number;
+}
