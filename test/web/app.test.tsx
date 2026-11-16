@@ -294,6 +294,19 @@ describe('repeat visits and same-message ordering', () => {
   const withBody = (id: number, text: string) => detail(id, { body: { text, source: 'plain', truncated: false } });
   const classifyStats = { attempted: 0, classified: 0, needsReview: 0, failed: 0, superseded: 0, remaining: 0, stoppedEarly: false };
 
+  it('keeps the active detail after a repeated row click and subsequent render', async () => {
+    setup();
+    mockApi.message.mockResolvedValue(detail(1));
+    await renderApp();
+    const activeRow = row('Subject 1');
+    fireEvent.click(activeRow);
+    await waitFor(() => expect(heading()).toBe('Subject 1'));
+    fireEvent.click(activeRow);
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search messages' }), { target: { value: 'Subject' } });
+    await waitFor(() => expect(heading()).toBe('Subject 1'));
+    expect(mockApi.message).toHaveBeenCalledTimes(1);
+  });
+
   it('does not revive a read from an earlier visit after going A → B → A', async () => {
     setup();
     await renderApp();

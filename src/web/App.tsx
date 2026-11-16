@@ -73,6 +73,8 @@ export function App() {
   );
 
   const select = useCallback((nextMailbox: MailboxName, id: number | null) => {
+    // Re-clicking the active row does not create a new visit or a new read.
+    if (selection.current.mailbox === nextMailbox && selection.current.id === id) return;
     selection.current = { mailbox: nextMailbox, id, token: selection.current.token + 1 };
     setMailbox(nextMailbox);
     setSelectedId(id);
