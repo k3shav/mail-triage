@@ -1,7 +1,7 @@
 import type { TaggingMode } from '../config.js';
 import { MAX_CLASSIFY_FAILURES, type Account, type Store, type TagCandidate, type TagOutcome, type TaxonomyRevision } from '../db/store.js';
 import { AppError } from '../errors.js';
-import { GmailApiError, type GmailClient, type GmailLabel } from '../gmail/client.js';
+import { GmailApiError, WriteSupersededError, type GmailClient, type GmailLabel, type WriteGuard } from '../gmail/client.js';
 import { LeaseLostError, type Lease } from './concurrency.js';
 import { planTags, tagPolicyKey, type TagPolicy } from './decisions.js';
 import { isFatalGmailError } from './sync.js';
@@ -115,6 +115,13 @@ export class Tagger {
           write?.();
           return true;
         });
+      // Run by the Gmail client immediately before each write attempt is sent: after any token
+      // refresh, 401 re-authorization, or retry wait. lease.commit throws LeaseLostError when another
+      // owner holds the mailbox.
+      const guard: WriteGuard = () => {
+        if (cancel.aborted) throw new GmailApiError(0, 'aborted', 'Gmail request cancelled');
+        if (!ifCurrent()) throw new WriteSupersededError();
+      };
 
       try {
         if (!ifCurrent()) {
@@ -150,24 +157,16 @@ export class Tagger {
           continue;
         }
 
-        // Re-check after the reads above and before any Gmail write.
-        if (!ifCurrent()) {
-          stats.superseded += 1;
-          continue;
-        }
+        // Every create and modify below passes `guard` right before it is sent.
         const ids: string[] = [];
         for (const name of missing) {
           if (stopped()) throw new GmailApiError(0, 'aborted', 'Gmail request cancelled');
-          const { id, created } = await this.ensureLabel(client, byName, name);
+          const { id, created } = await this.ensureLabel(client, byName, name, guard);
           if (created) stats.labelsCreated += 1;
           ids.push(id);
         }
-        if (stopped() || !ifCurrent()) {
-          if (stopped()) break;
-          stats.superseded += 1;
-          continue;
-        }
-        const updated = await client.addLabels(candidate.message.externalId, ids);
+        if (stopped()) break;
+        const updated = await client.addLabels(candidate.message.externalId, ids, guard);
         const unconfirmed = ids.filter((id) => !updated.labelIds.includes(id));
         if (unconfirmed.length > 0) throw new GmailApiError(502, 'unverified', 'Gmail did not confirm every label');
         // The write happened; record it even if the configuration moved on meanwhile.
@@ -180,6 +179,11 @@ export class Tagger {
       } catch (error) {
         if (error instanceof LeaseLostError || lease.signal.aborted) throw new LeaseLostError();
         if (cancel.aborted) break;
+        if (error instanceof WriteSupersededError) {
+          // Nothing was sent for this plan; the next cycle works from the new state.
+          stats.superseded += 1;
+          continue;
+        }
         if (isFatalGmailError(error)) throw error;
         if (error instanceof GmailApiError && error.status === 404) {
           lease.commit(() => record('skipped', [], 'Message is no longer in Gmail'));
@@ -197,11 +201,11 @@ export class Tagger {
   }
 
   /** Find a label by exact name, or create it. A concurrent creation (409) is resolved by listing again. */
-  private async ensureLabel(client: GmailClient, byName: Map<string, string>, name: string): Promise<{ id: string; created: boolean }> {
+  private async ensureLabel(client: GmailClient, byName: Map<string, string>, name: string, guard: WriteGuard): Promise<{ id: string; created: boolean }> {
     const existing = byName.get(name);
     if (existing) return { id: existing, created: false };
     try {
-      const created = await client.createLabel(name);
+      const created = await client.createLabel(name, guard);
       byName.set(created.name, created.id);
       return { id: created.id, created: true };
     } catch (error) {

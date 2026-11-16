@@ -120,7 +120,7 @@ For each classified message, Mail Triage plans one of these:
 
 `AUTO_LABEL_UNSCORED` does not invent a confidence and does not record an acceptance; the stored answer keeps a null confidence. The 0.7 threshold is a starting point, not a calibrated value; adjust it after checking labels against your own mail.
 
-Before each write, Mail Triage re-reads the message from Gmail, checks that the thread still matches, and re-checks (inside a database transaction that also verifies it still holds the mailbox lease) that the categories and the classification have not changed while it was waiting on Gmail. If anything changed, the write is skipped and the next cycle uses the new state. Labels are created on first use, matched by exact name, and reused.
+Before labeling, Mail Triage re-reads the message from Gmail and checks that the thread still matches. Then every Gmail write request (each label creation and each modify, including retries after rate limits, network errors, or a token refresh) is checked immediately before it is sent: inside one database transaction, Mail Triage verifies that it still holds the mailbox lease and that the account, message, categories, and classification have not changed. If anything changed, nothing more is sent for that message and the next cycle uses the new state. Labels are created on first use, matched by exact name, and reused.
 
 `Needs Review` is a normal Gmail label. Review messages in Gmail, apply your own labels if you like, and remove `Needs Review` when you are done; it will not come back unless the message is classified again (for example after a categories change).
 

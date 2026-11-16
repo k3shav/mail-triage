@@ -70,6 +70,8 @@ export class FakeGoogle {
    * while a request is in flight or to stall it. Honors the request's abort signal.
    */
   before: ((url: URL, method: string) => Promise<void> | void) | null = null;
+  /** Awaited before a refresh-token grant is answered, to change state while a token refresh is in flight. */
+  beforeRefresh: (() => Promise<void> | void) | null = null;
   private labelCounter = 0;
 
   addMessages(...messages: FakeMessage[]) {
@@ -95,6 +97,10 @@ export class FakeGoogle {
   /** Every Gmail API call that could change the mailbox (label creation, modify). */
   gmailWrites(): FakeCall[] {
     return this.calls.filter((call) => call.method !== 'GET' && call.url.startsWith('https://gmail.googleapis.com'));
+  }
+
+  labelCreates(): FakeCall[] {
+    return this.calls.filter((call) => call.method === 'POST' && call.url === 'https://gmail.googleapis.com/gmail/v1/users/me/labels');
   }
 
   gmailCalls(): FakeCall[] {
@@ -139,6 +145,7 @@ export class FakeGoogle {
         });
       }
       if (params.get('grant_type') === 'refresh_token') {
+        await this.beforeRefresh?.();
         if (this.refreshInvalidGrant) return this.json({ error: 'invalid_grant' }, 400);
         return this.json({ access_token: this.issueAccess(), expires_in: 3599, token_type: 'Bearer', scope: this.grantedScopes.join(' ') });
       }

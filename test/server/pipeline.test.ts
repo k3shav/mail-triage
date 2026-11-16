@@ -6,6 +6,7 @@ import type { FieldDecision } from '../../src/core/decision.js';
 import { DEFAULT_TAXONOMY } from '../../src/core/taxonomy.js';
 import { ProviderError } from '../../src/providers/errors.js';
 import { GMAIL_SCOPES } from '../../src/server/config.js';
+import { PROMPT_VERSION } from '../../src/core/prompt.js';
 import { MAX_CLASSIFY_FAILURES } from '../../src/server/db/store.js';
 import { LOCK_TTL_MS } from '../../src/server/services/concurrency.js';
 import { formatCycle } from '../../src/server/services/pipeline.js';
@@ -247,6 +248,8 @@ describe('changes while Gmail calls are in flight', () => {
     };
     const result = await run(h);
     expect(result.tag!.superseded).toBeGreaterThanOrEqual(1);
+    // Only the request already in flight reached Gmail; no further label for the old plan was created.
+    expect(h.google.labelCreates()).toHaveLength(1);
     expect(h.google.modifyCalls()).toHaveLength(0);
   });
 
@@ -266,6 +269,119 @@ describe('changes while Gmail calls are in flight', () => {
     const next = await run(h);
     expect(next.classify).toMatchObject({ classified: 2 });
     expect(namespaced(h, 'm1')).toContain('Mail Triage/Category/FYI');
+  });
+});
+
+describe('every Gmail write attempt is checked right before it is sent', () => {
+  type Mutation = 'categories changed' | 'message reclassified' | 'Gmail disconnected' | 'lease taken over';
+
+  function mutate(h: Harness, mutation: Mutation, accountId: string) {
+    if (mutation === 'categories changed') h.store.replaceTaxonomy({ ...DEFAULT_TAXONOMY, userContext: 'Changed while waiting.' });
+    else if (mutation === 'Gmail disconnected') h.store.deleteAccount(accountId);
+    else if (mutation === 'lease taken over') expect(h.store.acquireLock(`pipeline:${accountId}`, 'cron', LOCK_TTL_MS)).toBe(true);
+    else {
+      const m1 = h.store.db.prepare("SELECT id, decision_seq AS seq FROM messages WHERE external_id = 'm1'").get() as { id: number; seq: number };
+      const { revision, hash } = h.store.currentTaxonomy();
+      const stored = h.store.insertClassification({
+        accountId,
+        messageId: m1.id,
+        taxonomyRevision: revision,
+        taxonomyHash: hash,
+        promptVersion: PROMPT_VERSION,
+        decision: {
+          provider: 'jev',
+          requestedModel: 'jev-latest',
+          model: 'jev-1.13.0',
+          confidenceKind: 'provider',
+          fields: { category: confident('fyi'), action: confident('no_action'), priority: confident('low') },
+          usage: null,
+        },
+        expectedDecisionSeq: m1.seq,
+      });
+      expect(stored).not.toBeNull();
+    }
+  }
+
+  const mutations: Mutation[] = ['categories changed', 'message reclassified', 'Gmail disconnected', 'lease taken over'];
+  const cases = (['create label', 'add labels'] as const).flatMap((write) => mutations.map((mutation) => [write, mutation] as const));
+
+  it.each(cases)('%s: no request is sent when the plan goes stale during the token refresh (%s)', async (write, mutation) => {
+    const h = await mailbox();
+    await run(h, 'dry-run');
+    const accountId = h.store.getGmailAccount()!.id;
+    if (write === 'add labels') for (const name of Object.values(L)) h.google.addLabel(name);
+    // After the last read before the first write, the cached access token expires, so the write's token.get() refreshes.
+    h.google.before = (url, method) => {
+      if (method === 'GET' && url.pathname.endsWith('/labels')) h.clock.now += 2 * 3600_000;
+    };
+    let mutated = false;
+    h.google.beforeRefresh = () => {
+      if (mutated) return;
+      mutated = true;
+      mutate(h, mutation, accountId);
+    };
+
+    const result = await run(h);
+    expect(mutated).toBe(true);
+    if (mutation === 'message reclassified') {
+      // Only m1's plan went stale: nothing for it is sent, while m2's unchanged plan proceeds.
+      const created = h.google.labelCreates().map((call) => JSON.parse(call.body!).name);
+      expect(created).not.toEqual(expect.arrayContaining([L.notification]));
+      expect(created.filter((name: string) => [L.notification, L.needsAction, L.high].includes(name))).toEqual([]);
+      expect(h.google.modifyCalls().map((call) => call.url)).toEqual([expect.stringMatching(/\/messages\/m2\/modify$/)]);
+      expect(result.tag).toMatchObject({ superseded: 1, labeled: 1, failed: 0 });
+      expect(namespaced(h, 'm1')).toEqual([]);
+      return;
+    }
+    expect(h.google.gmailWrites()).toHaveLength(0);
+    if (mutation === 'lease taken over') {
+      expect(result).toMatchObject({ status: 'failed', error: expect.stringMatching(/Another process took over/) });
+    } else {
+      expect(result.status).toBe('ok');
+      expect(result.tag).toMatchObject({ labeled: 0, failed: 0, labelsCreated: 0, labelsAdded: 0 });
+      expect(result.tag!.superseded).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it.each([
+    ['429 then a retry', 429],
+    ['401 then a token refresh', 401],
+  ] as const)('does not resend a stale label creation after %s', async (_name, status) => {
+    const h = await mailbox();
+    await run(h, 'dry-run');
+    h.google.respond = (url, method) => {
+      if (method !== 'POST' || h.google.labelCreates().length !== 1) return undefined;
+      h.store.replaceTaxonomy({ ...DEFAULT_TAXONOMY, userContext: `Changed after ${status}.` });
+      return new Response(JSON.stringify({ error: { code: status } }), { status, headers: { 'retry-after': '0' } });
+    };
+    const result = await run(h);
+    expect(result.status).toBe('ok');
+    expect(result.tag).toMatchObject({ labeled: 0, failed: 0 });
+    expect(h.google.labelCreates()).toHaveLength(1);
+    expect(h.google.modifyCalls()).toHaveLength(0);
+  });
+
+  it('still retries writes for an unchanged plan', async () => {
+    const h = await mailbox();
+    let failedCreate = false;
+    let failedModify = false;
+    h.google.respond = (url, method) => {
+      if (method !== 'POST') return undefined;
+      if (!failedCreate && url.pathname.endsWith('/labels')) {
+        failedCreate = true;
+        return new Response('{}', { status: 429, headers: { 'retry-after': '0' } });
+      }
+      if (!failedModify && url.pathname.endsWith('/modify')) {
+        failedModify = true;
+        return new Response('{}', { status: 401 });
+      }
+      return undefined;
+    };
+    const result = await run(h);
+    expect(result).toMatchObject({ status: 'ok', tag: { labeled: 2, labelsCreated: 6, superseded: 0 } });
+    expect(h.google.labelCreates()).toHaveLength(7);
+    expect(h.google.modifyCalls()).toHaveLength(3);
+    expect(namespaced(h, 'm1')).toEqual([L.needsAction, L.notification, L.high].sort());
   });
 });
 
